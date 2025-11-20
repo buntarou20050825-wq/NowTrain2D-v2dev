@@ -43,7 +43,7 @@ NowTrain-v2/
 ### 前提条件
 
 - Node.js (v18 以上推奨)
-- Python 3.8 以上
+- **Python 3.9 以上（3.10 推奨）**
 - Mapbox アクセストークン（[こちら](https://account.mapbox.com/access-tokens/)から取得）
 
 ### フロントエンド
@@ -78,7 +78,31 @@ npm run dev
 
 デフォルトで http://localhost:5173 で起動します。
 
-### バックエンド
+### バックエンド（MS2以降）
+
+#### データ準備
+
+**重要**: バックエンドは `data/mini-tokyo-3d/` のデータを使用します。以下のコマンドでフロントエンドのデータをコピーしてください。
+
+**macOS / Linux:**
+
+```bash
+cd NowTrain-v2
+mkdir -p data/mini-tokyo-3d
+cp -r frontend/public/data/mini-tokyo-3d/* data/mini-tokyo-3d/
+```
+
+**Windows PowerShell:**
+
+```powershell
+cd NowTrain-v2
+New-Item -ItemType Directory -Force -Path "data\mini-tokyo-3d" | Out-Null
+Copy-Item -Recurse "frontend\public\data\mini-tokyo-3d\*" "data\mini-tokyo-3d\"
+```
+
+> **注意**: `data/mini-tokyo-3d/` は `.gitignore` に含まれています。JSON ファイルが壊れた場合は、上記コマンドで再コピーしてください。
+
+#### セットアップ
 
 1. ディレクトリに移動
 
@@ -112,25 +136,62 @@ uvicorn main:app --reload --port 8000
 
 デフォルトで http://localhost:8000 で起動します。
 
-## CORS 設定について
+## CORS 設定について（MS2以降）
 
-バックエンド（FastAPI）の CORS 設定は、デフォルトでフロントエンドの開発サーバー（`http://localhost:5173`）を許可しています。
+バックエンド（FastAPI）の CORS 設定は、環境変数 `FRONTEND_URL` で制御されます。デフォルトは `http://localhost:5173` です。
 
-フロントエンドのポートを変更する場合は、`backend/main.py` の `origins` リストも合わせて変更してください。
+複数の URL を許可する場合は、`backend/.env` ファイルを作成して以下のように設定してください：
+
+```env
+FRONTEND_URL=http://localhost:5173,http://127.0.0.1:5173
+```
+
+## API 仕様（MS2）
+
+バックエンドは以下の API エンドポイントを提供します。詳細は http://localhost:8000/docs で確認できます。
+
+- `GET /api/health` - ヘルスチェック
+- `GET /api/lines` - 全路線一覧（`operator` パラメータでフィルタ可能）
+- `GET /api/lines/{lineId}` - 特定路線の詳細
+- `GET /api/stations?lineId={lineId}` - 指定路線の駅一覧
+- `GET /api/shapes?lineId={lineId}` - 指定路線の形状（GeoJSON）
 
 ## MS1 完了の確認項目
 
-- [ ] Mapbox が正しく表示される（地図が出ている）
-- [ ] 山手線の路線（黄緑色の線）がループ状に表示される
-- [ ] 山手線の駅（白い円＋黒枠）が各駅位置に表示される
-- [ ] 駅名ラベル（日本語）が駅の近くに表示される
-- [ ] `/api/health` が `{"status": "ok"}` を返す
-- [ ] ブラウザのコンソールにエラーが出ていない
+- [x] Mapbox が正しく表示される（地図が出ている）
+- [x] 山手線の路線（黄緑色の線）がループ状に表示される
+- [x] 山手線の駅（白い円＋黒枠）が各駅位置に表示される
+- [x] 駅名ラベル（日本語）が駅の近くに表示される
+- [x] `/api/health` が `{"status": "ok"}` を返す
+- [x] ブラウザのコンソールにエラーが出ていない
+
+## MS2 完了の確認項目
+
+### バックエンド
+
+- [ ] `data/mini-tokyo-3d/` に `railways.json`, `stations.json`, `coordinates.json` が存在する
+- [ ] バックエンド起動時に `Data loaded: XXX railways, YYY stations` のログが表示される
+- [ ] `GET /api/health` が正常に `{"status":"ok"}` を返す
+- [ ] `GET /api/lines` で路線一覧が取得できる
+- [ ] `GET /api/lines?operator=JR-East` で JR東日本の路線のみが返る
+- [ ] `GET /api/lines/JR-East.Yamanote` が期待通りの JSON を返す
+- [ ] `GET /api/stations?lineId=JR-East.Yamanote` が駅一覧を返す
+- [ ] 各駅オブジェクトに `coord.lon` / `coord.lat` が含まれる
+- [ ] `GET /api/shapes?lineId=JR-East.Yamanote` が GeoJSON FeatureCollection を返す
+- [ ] `/api/shapes` の `coordinates` 配列に数百点以上の座標が含まれている
+- [ ] 不正な `lineId` に対して適切なエラー（404 または 400）が返る
+- [ ] `http://localhost:8000/docs` で API ドキュメントが確認できる
+
+### フロントエンド
+
+- [ ] MS1 で実装した山手線の静的描画が引き続き動作している
+- [ ] ブラウザコンソールに `/api/lines` の結果が表示される
+- [ ] フロントとバックを同時に起動しても CORS エラーが出ない
 
 ## 開発ロードマップ
 
-- **MS1** (現在): プロジェクト土台 + 2D マップ上に山手線の路線と駅を静的表示 ✅
-- **MS2**: FastAPI で静的データを API 化
+- **MS1**: プロジェクト土台 + 2D マップ上に山手線の路線と駅を静的表示 ✅
+- **MS2** (現在): FastAPI で静的データを API 化
 - **MS3**: 時刻表ベースの列車シミュレーション
 - **MS4**: GTFS-RT との統合
 - **MS5**: UI/UX 強化

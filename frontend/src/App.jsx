@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
 import { fetchRailways, fetchStations, fetchCoordinates } from "./api/staticData";
+import { fetchLinesFromApi } from "./api/serverData";
 
 const YAMANOTE_ID = "JR-East.Yamanote";
 
@@ -177,6 +178,10 @@ function App() {
           "text-halo-width": 1,
         },
       });
+
+      // MS2: API の動作確認（描画まで移行するのは MS3 以降）
+      const apiData = await fetchLinesFromApi();
+      console.log("API /api/lines result:", apiData);
     });
 
     return () => {

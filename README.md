@@ -641,10 +641,239 @@ Mapbox GL JS の `case` 式を使って、列車の状態に応じて色を動�
 - **MS3-1**: 山手線の時刻表読み込みと日跨ぎ正規化 ✅
 - **MS3-2**: 時刻表ベースの列車位置計算 ✅
 - **MS3-3**: 列車位置 API の実装 ✅
-- **MS3-4** (現在): フロントエンドで列車をリアルタイム表示 ✅
-- **MS4**: GTFS-RT との統合
+- **MS3-4**: フロントエンドで列車をリアルタイム表示 ✅
+- **MS4-1**: GTFS-RT データの取得とパース ✅
+- **MS4-2**: 列車 ID マッチング（時刻表 ↔ GTFS-RT）
+- **MS4-3**: 遅延情報の反映
+- **MS4-4**: リアルタイム位置のフロントエンド統合
 - **MS5**: UI/UX 強化
 - **MS6**: パフォーマンス調整・デプロイ・仕上げ
+
+---
+
+## MS4: GTFS-RT との統合
+
+MS4 では、公共交通オープンデータセンター（ODPT）の GTFS-RT API を利用して、リアルタイムの遅延情報を取得し、時刻表ベースの位置計算と統合します。
+
+### MS4 の全体像
+
+MS4 を以下の4つのサブマイルストーンに分割して進めます:
+
+- **MS4-1**: GTFS-RT データの取得とパース ✅
+- **MS4-2**: 列車 ID マッチング（時刻表 ↔ GTFS-RT）
+- **MS4-3**: 遅延情報の反映
+- **MS4-4**: リアルタイム位置のフロントエンド統合
+
+---
+
+## MS4-1: GTFS-RT データの取得とパース ✅
+
+### 概要
+
+公共交通オープンデータセンター（ODPT）の API から JR東日本のリアルタイム列車情報（GTFS-RT）を取得し、Python でパースして中身が読めることを確認します。
+
+- GTFS-RT は Protocol Buffers 形式
+- **まだ位置情報の統合（マージ）は行わない**
+- データ取得とパースのみを実装
+
+### 前提条件
+
+#### APIキーの取得
+
+ODPT API を使用するには、無料の API キーが必要です:
+
+1. [公共交通オープンデータセンター](https://developer.odpt.org/) にアクセス
+2. 無料登録してマイページから API キーを発行
+3. `backend/.env` に API キーを設定:
+
+```env
+ODPT_API_KEY=your_api_key_here
+FRONTEND_URL=http://localhost:5173
+```
+
+#### エンドポイント
+
+JR東日本の GTFS-RT エンドポイント:
+```
+https://api-challenge.odpt.org/api/v4/gtfs/realtime/jreast_odpt_train_trip_update
+```
+
+### 実装内容
+
+#### backend/requirements.txt (拡張)
+
+GTFS-RT 用のライブラリを追加:
+```txt
+requests>=2.31.0
+gtfs-realtime-bindings>=1.0.0
+```
+
+#### backend/gtfs_client.py (新規作成)
+
+GTFS-RT データを取得するクライアント:
+
+**主要クラス:**
+- `GtfsClient`: GTFS-RT データ取得クライアント
+  - `fetch_vehicle_positions()`: 列車位置情報（TripUpdate）を取得
+  - `fetch_trip_updates()`: 遅延情報（TripUpdate）を取得 ※MS4-2以降で使用
+  - `_fetch_feed()`: GTFS-RT フィードを取得してパースする共通処理
+
+**認証方法:**
+- API キーはクエリパラメータで送信: `?acl:consumerKey={api_key}`
+- 環境変数 `ODPT_API_KEY` から読み込み
+
+**エラーハンドリング:**
+- 接続タイムアウト（5秒接続、10秒読み取り）
+- HTTP エラー（401: 認証失敗、404: エンドポイント不正）
+- パースエラー
+
+#### backend/test_gtfs.py (新規作成)
+
+動作確認用のテストスクリプト:
+- GTFS-RT データを取得
+- JR東日本の列車（最初の10件）を表示
+- trip_id, route_id, direction_id, stop_time_update 数を出力
+
+### データ形式の重要な発見
+
+#### 1. TripUpdate 形式
+
+ODPT API は **VehiclePosition** ではなく **TripUpdate** 形式を返します:
+
+**TripUpdate に含まれる情報:**
+- `trip_id`: 列車ID（例: `"1101003H"`）
+- `route_id`: 路線ID（**多くの場合、空文字列**）
+- `direction_id`: 方向ID（0 or 1）
+- `stop_time_update`: 停車駅ごとの到着/発車予測時刻と遅延情報
+
+**TripUpdate に含まれない情報:**
+- 緯度経度（lat/lon）
+- 速度（speed）
+- 方位角（bearing）
+
+#### 2. route_id が空
+
+ODPT の GTFS-RT データでは、`route_id` フィールドがほとんどのエンティティで空文字列です。
+そのため、山手線を特定するには:
+- `trip_id` のパターンから推定
+- `stop_id` のパターンから判断
+- 静的 GTFS データとの照合
+
+が必要になります（MS4-2 で実装予定）。
+
+### 動作確認
+
+```bash
+cd backend
+python test_gtfs.py
+```
+
+**成功時の出力例:**
+```
+[INFO] Fetching GTFS-RT from https://api-challenge.odpt.org/api/v4/gtfs/realtime/jreast_odpt_train_trip_update
+[INFO] Status: 200
+[INFO] Received 201957 bytes
+[INFO] Parsed 321 entities
+[INFO] Fetched 321 entities
+
+============================================================
+Found 10 JR-East trains (showing first 10)
+============================================================
+
+--- JR-East Train #1 ---
+Entity ID:     1101023T
+Trip ID:       1101023T
+Route ID:      
+Direction ID:  0
+Stop Updates:  24
+...
+
+SUMMARY: Successfully fetched 10 JR-East trains
+```
+
+### MS4-1 完了の確認項目
+
+- [x] `backend/requirements.txt` に `requests` と `gtfs-realtime-bindings` を追加
+- [x] `pip install -r requirements.txt` でライブラリをインストール
+- [x] `backend/gtfs_client.py` を作成
+- [x] `backend/test_gtfs.py` を作成
+- [x] `backend/.env` に `ODPT_API_KEY` を設定
+- [x] `python test_gtfs.py` を実行してエラーが出ない
+- [x] 300件前後の JR東日本列車エンティティが取得できる
+- [x] TripUpdate 形式のデータが正しくパースされる
+
+### MS4-2 以降の課題
+
+MS4-1 完了により、以下の課題が明確になりました:
+
+1. **山手線の特定方法**: `trip_id` または `stop_id` のパターンから山手線を識別
+2. **ID マッチング**: 静的データの ID（`JR-East.Yamanote.1068G.Weekday`）と GTFS-RT の ID（`1101003H`）の対応付け
+3. **位置情報の計算**: TripUpdate には緯度経度が含まれないため、遅延情報と静的時刻表から位置を推定
+
+これらは MS4-2 以降で実装します。
+
+---
+
+## MS4-2: 列車 ID マッチング（予定）
+
+### 概要
+
+GTFS-RT の `trip_id` と静的時刻表データの列車 ID をマッチングするロジックを実装します。
+
+### 実装予定内容
+
+- 山手線の列車を `trip_id` パターンまたは `stop_id` パターンから特定
+- GTFS-RT の `trip_id` と静的データの `base_id` のマッピングを構築
+- マッチング結果をログに出力して検証
+
+### MS4-2 完了の確認項目（予定）
+
+- [ ] 山手線の列車が正しくフィルタリングされる
+- [ ] GTFS-RT と静的時刻表の列車が対応付けられる
+- [ ] マッチング率が 80% 以上である
+
+---
+
+## MS4-3: 遅延情報の反映（予定）
+
+### 概要
+
+GTFS-RT の遅延情報（`delay_seconds`）を時刻表ベースの位置計算に反映させます。
+
+### 実装予定内容
+
+- TripUpdate の `stop_time_update` から遅延情報を取得
+- 時刻表の予定時刻に遅延を加算して実際の位置を計算
+- `/api/yamanote/positions` のレスポンスに遅延情報を含める
+
+### MS4-3 完了の確認項目（予定）
+
+- [ ] 遅延情報が API レスポンスに含まれる
+- [ ] 遅延を考慮した列車位置が計算される
+- [ ] `is_scheduled` フラグが正しく設定される
+
+---
+
+## MS4-4: リアルタイム位置のフロントエンド統合（予定）
+
+### 概要
+
+遅延情報を反映した列車位置をフロントエンドで表示します。
+
+### 実装予定内容
+
+- マーカーの色を遅延度合いに応じて変更（定時: 緑、遅延: 黄色、大幅遅延: 赤）
+- ツールチップで遅延情報を表示
+- リアルタイムデータと時刻表データの切り替え機能
+
+### MS4-4 完了の確認項目（予定）
+
+- [ ] 遅延情報がマーカー色に反映される
+- [ ] ツールチップで遅延秒数が確認できる
+- [ ] リアルタイムデータが正しく表示される
+
+---
+
 
 ## ライセンス
 

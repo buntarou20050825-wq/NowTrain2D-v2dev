@@ -315,7 +315,7 @@ class DataCache:
 
         # 2) MS3-1: 山手線の時刻表
         try:
-            raw_yamanote = self._load_json("train-timetables/jreast-yamanote.json")
+            raw_yamanote = self._load_json("mini-tokyo-3d/train-timetables/jreast-yamanote.json")
         except FileNotFoundError:
             logger.error(
                 "Yamanote timetable file not found. "

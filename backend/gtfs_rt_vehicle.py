@@ -3,9 +3,10 @@ GTFS-RT VehiclePosition から山手線の列車位置を取得
 """
 import os
 import httpx
+import asyncio
 from google.transit import gtfs_realtime_pb2
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 
 
 @dataclass
@@ -19,6 +20,22 @@ class YamanoteTrainPosition:
     stop_sequence: int
     status: int            # 1=STOPPED_AT, 2=IN_TRANSIT_TO
     timestamp: int
+
+
+@dataclass
+class YamanoteTrainPositionWithSchedule:
+    """山手線の列車位置（出発時刻付き）"""
+    trip_id: str
+    train_number: str
+    direction: str
+    latitude: float
+    longitude: float
+    stop_sequence: int
+    status: int
+    timestamp: int
+    # 新規追加
+    departure_time: Optional[int] = None  # 現在駅の出発時刻（UNIXタイムスタンプ）
+    next_arrival_time: Optional[int] = None  # 次駅の到着時刻
 
 
 def is_yamanote(trip_id: str) -> bool:
@@ -146,6 +163,87 @@ def fetch_yamanote_positions_sync(api_key: str) -> list[YamanoteTrainPosition]:
             stop_sequence=vp.current_stop_sequence,
             status=vp.current_status,
             timestamp=vp.timestamp
+        ))
+    
+    return positions
+
+
+async def fetch_yamanote_positions_with_schedule(api_key: str) -> list[YamanoteTrainPositionWithSchedule]:
+    """
+    VehiclePosition と TripUpdate を統合して、出発時刻付きの位置情報を返す
+    """
+    # 1. VehiclePosition を取得
+    vehicle_url = "https://api-challenge.odpt.org/api/v4/gtfs/realtime/jreast_odpt_train_vehicle"
+    
+    # 2. TripUpdate を取得
+    trip_update_url = "https://api-challenge.odpt.org/api/v4/gtfs/realtime/jreast_odpt_train_trip_update"
+    
+    async with httpx.AsyncClient() as client:
+        vehicle_resp, trip_resp = await asyncio.gather(
+            client.get(vehicle_url, params={"acl:consumerKey": api_key}, timeout=30.0),
+            client.get(trip_update_url, params={"acl:consumerKey": api_key}, timeout=30.0),
+        )
+    
+    # VehiclePosition をパース
+    vehicle_feed = gtfs_realtime_pb2.FeedMessage()
+    vehicle_feed.ParseFromString(vehicle_resp.content)
+    
+    # TripUpdate をパースしてマップ化
+    trip_feed = gtfs_realtime_pb2.FeedMessage()
+    trip_feed.ParseFromString(trip_resp.content)
+    
+    # trip_id → {stop_sequence: {arrival, departure}} のマップ
+    trip_schedules = {}
+    for entity in trip_feed.entity:
+        if not entity.HasField('trip_update'):
+            continue
+        tu = entity.trip_update
+        trip_id = tu.trip.trip_id
+        if not is_yamanote(trip_id):
+            continue
+        
+        schedules = {}
+        for stu in tu.stop_time_update:
+            schedules[stu.stop_sequence] = {
+                'arrival': stu.arrival.time if stu.HasField('arrival') else None,
+                'departure': stu.departure.time if stu.HasField('departure') else None,
+            }
+        trip_schedules[trip_id] = schedules
+    
+    # VehiclePosition と TripUpdate を統合
+    positions = []
+    for entity in vehicle_feed.entity:
+        if not entity.HasField('vehicle'):
+            continue
+        
+        vp = entity.vehicle
+        trip_id = vp.trip.trip_id
+        
+        if not is_yamanote(trip_id):
+            continue
+        
+        # TripUpdate から出発時刻を取得
+        departure_time = None
+        next_arrival_time = None
+        if trip_id in trip_schedules:
+            current_seq = vp.current_stop_sequence
+            if current_seq in trip_schedules[trip_id]:
+                departure_time = trip_schedules[trip_id][current_seq].get('departure')
+            next_seq = current_seq + 1
+            if next_seq in trip_schedules[trip_id]:
+                next_arrival_time = trip_schedules[trip_id][next_seq].get('arrival')
+        
+        positions.append(YamanoteTrainPositionWithSchedule(
+            trip_id=trip_id,
+            train_number=get_train_number(trip_id),
+            direction=get_direction(trip_id),
+            latitude=vp.position.latitude,
+            longitude=vp.position.longitude,
+            stop_sequence=vp.current_stop_sequence,
+            status=vp.current_status,
+            timestamp=vp.timestamp,
+            departure_time=departure_time,
+            next_arrival_time=next_arrival_time,
         ))
     
     return positions

@@ -48,6 +48,7 @@ class TrainPosition:
     # 将来の GTFS-RT 統合用フィールド（今はデフォルト値）
     is_scheduled: bool = True     # 時刻表ベースの位置なら True
     delay_seconds: int = 0        # 遅延秒数（GTFS-RT統合時に使用）
+    departure_time: Optional[int] = None # 発車予定時刻（秒）
 
 
 class TrainPositionResponse(BaseModel):
@@ -71,6 +72,7 @@ class TrainPositionResponse(BaseModel):
 
     is_scheduled: bool
     delay_seconds: int
+    departure_time: Optional[int]
 
     @classmethod
     def from_dataclass(cls, pos: TrainPosition) -> "TrainPositionResponse":
@@ -328,6 +330,7 @@ def train_state_to_position(
             current_time_sec=state.current_time_sec,
             is_scheduled=True,
             delay_seconds=0,
+            departure_time=state.segment_end_sec,  # 停車セグメントの終了時刻＝発車時刻
         )
 
     # ★ 走行中
@@ -357,6 +360,7 @@ def train_state_to_position(
         current_time_sec=state.current_time_sec,
         is_scheduled=True,
         delay_seconds=0,
+        departure_time=None,  # 走行中は次駅到着時刻などが該当するが、ここではNoneまたは次セグメント情報が必要
     )
 
 

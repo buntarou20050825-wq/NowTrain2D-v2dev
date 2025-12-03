@@ -298,3 +298,35 @@ async def get_yamanote_positions():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+@app.get("/api/trains/yamanote/positions/v2")
+async def get_yamanote_positions_v2():
+    """
+    山手線のリアルタイム列車位置を取得（出発時刻付き）
+    """
+    api_key = os.getenv("ODPT_API_KEY", "").strip()
+    
+    try:
+        from gtfs_rt_vehicle import fetch_yamanote_positions_with_schedule
+        positions = await fetch_yamanote_positions_with_schedule(api_key)
+        
+        return {
+            "timestamp": positions[0].timestamp if positions else 0,
+            "count": len(positions),
+            "trains": [
+                {
+                    "tripId": p.trip_id,
+                    "trainNumber": p.train_number,
+                    "direction": p.direction,
+                    "latitude": p.latitude,
+                    "longitude": p.longitude,
+                    "stopSequence": p.stop_sequence,
+                    "status": p.status,
+                    # 新規追加
+                    "departureTime": p.departure_time,
+                    "nextArrivalTime": p.next_arrival_time,
+                }
+                for p in positions
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

@@ -46,7 +46,8 @@ async def startup_event():
 
 
 # CORS 設定
-_raw_origins = os.getenv("FRONTEND_URL", "http://localhost:5173")
+_default_origins = "http://localhost:5173,http://localhost:5174"  # 5174を追加
+_raw_origins = os.getenv("FRONTEND_URL", _default_origins)
 frontend_urls = [
     origin.strip()
     for origin in _raw_origins.split(",")
@@ -378,6 +379,9 @@ async def get_yamanote_positions_v3():
                     "isStopped": pos.is_stopped,
                     "stationId": pos.station_id,
                     "dataQuality": pos.data_quality,
+                    # ★ 新規追加: フロントエンドが期待しているフィールド
+                    "stopSequence": pos.gtfs_stop_sequence,
+                    "gtfsStatus": pos.gtfs_status,
                 }
                 for pos in positions
             ]

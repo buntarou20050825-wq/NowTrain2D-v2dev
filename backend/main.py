@@ -46,7 +46,8 @@ async def startup_event():
 
 
 # CORS 設定
-_raw_origins = os.getenv("FRONTEND_URL", "http://localhost:5173")
+_default_origins = "http://localhost:5173,http://localhost:5174"  # 5174を追加
+_raw_origins = os.getenv("FRONTEND_URL", _default_origins)
 frontend_urls = [
     origin.strip()
     for origin in _raw_origins.split(",")
@@ -361,6 +362,20 @@ async def get_yamanote_positions_v3():
             gtfs_data
         )
         
+        # ★ デバッグ用: マッチングしなかったGTFSキーのサンプルを出力
+        if gtfs_data:
+            gtfs_keys = set(gtfs_data.keys())
+            # マッチ成功したキー（timetable_only 以外）
+            matched_keys = {p.number for p in positions if p.data_quality != "timetable_only"}
+            
+            # マッチしなかったキー
+            unmatched_gtfs = list(gtfs_keys - matched_keys)
+            
+            if unmatched_gtfs:
+                logger.warning(f"Unmatched GTFS keys (sample 5): {unmatched_gtfs[:5]}")
+            else:
+                logger.info("All GTFS data matched successfully!")
+        
         # 4. レスポンスを構築
         return {
             "timestamp": current_time.isoformat(),
@@ -378,6 +393,9 @@ async def get_yamanote_positions_v3():
                     "isStopped": pos.is_stopped,
                     "stationId": pos.station_id,
                     "dataQuality": pos.data_quality,
+                    # ★ 新規追加: フロントエンドが期待しているフィールド
+                    "stopSequence": pos.gtfs_stop_sequence,
+                    "gtfsStatus": pos.gtfs_status,
                 }
                 for pos in positions
             ]

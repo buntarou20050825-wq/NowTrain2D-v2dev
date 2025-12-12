@@ -52,6 +52,10 @@ class TrainPosition:
     delay_seconds: int = 0        # 遅延秒数（GTFS-RT統合時に使用）
     departure_time: Optional[int] = None # 発車予定時刻（秒）
     data_quality: str = "timetable_only"  # "good", "stale", "rejected", "timetable_only", "error"
+    
+    # GTFS-RT 生情報
+    gtfs_stop_sequence: Optional[int] = None
+    gtfs_status: Optional[int] = None
 
 
 class TrainPositionResponse(BaseModel):
@@ -77,6 +81,10 @@ class TrainPositionResponse(BaseModel):
     delay_seconds: int
     departure_time: Optional[int]
     data_quality: str
+    
+    # GTFS-RT 生情報
+    gtfs_stop_sequence: Optional[int] = None
+    gtfs_status: Optional[int] = None
 
     @classmethod
     def from_dataclass(cls, pos: TrainPosition) -> "TrainPositionResponse":
@@ -564,7 +572,7 @@ def estimate_segment_progress(
     segment_coords: list[list[float]],  # [[lon, lat], [lon, lat], ...]
     target_lat: float,
     target_lon: float,
-    max_distance_m: float = 200.0
+    max_distance_m: float = 500.0  # 200.0 -> 500.0 に緩和
 ) -> float | None:
     """
     GTFS-RT座標から区間内の進捗率を推定する。
@@ -641,11 +649,13 @@ def train_state_to_position_with_override(
     state: "TrainSectionState",
     cache: "DataCache",
     override_progress: float | None = None,
-    data_quality: str = "timetable_only"
+    data_quality: str = "timetable_only",
+    gtfs_info: dict | None = None  # ★ 追加: GTFS情報
 ) -> Optional[TrainPosition]:
     """
     TrainSectionState を TrainPosition（座標）に変換する。
     override_progress が指定された場合、state.progress の代わりにその値を使用する。
+    gtfs_info が指定された場合、GTFS-RT情報を TrainPosition に含める。
     """
     train = state.train
 
@@ -654,6 +664,10 @@ def train_state_to_position_with_override(
         if train.service_type and train.service_type != "Unknown"
         else train.base_id
     )
+
+    # GTFS情報を取り出す
+    stop_seq = gtfs_info.get("stop_sequence") if gtfs_info else None
+    status = gtfs_info.get("status") if gtfs_info else None
 
     # 停車中
     if state.is_stopped:
@@ -683,6 +697,8 @@ def train_state_to_position_with_override(
             delay_seconds=0,
             departure_time=state.segment_end_sec,
             data_quality=data_quality,
+            gtfs_stop_sequence=stop_seq,
+            gtfs_status=status,
         )
 
     # 走行中
@@ -716,6 +732,8 @@ def train_state_to_position_with_override(
         delay_seconds=0,
         departure_time=None,
         data_quality=data_quality,
+        gtfs_stop_sequence=stop_seq,
+        gtfs_status=status,
     )
 
 
@@ -749,9 +767,29 @@ def get_blended_train_positions(
         if gtfs_data and state.train.number in gtfs_data:
             gtfs_position = gtfs_data[state.train.number]
         
+        # ★ デバッグログ: IDマッチング確認
+        if gtfs_data:
+            # 最初の5件と特定列車のみログ出力
+            sample_numbers = list(gtfs_data.keys())[:5]
+            if state.train.number in sample_numbers or state.train.number == "906G":
+                logger.info(
+                    f"[DEBUG] Train {state.train.number}: "
+                    f"GTFS match={'YES' if gtfs_position else 'NO'}, "
+                    f"is_stopped={state.is_stopped}, "
+                    f"from={state.from_station_id}, to={state.to_station_id}"
+                )
+        
         # 3. 走行中の場合のみブレンド処理を試みる
         blended_progress = state.progress
         data_quality = "timetable_only"
+        
+        # GTFS情報を辞書にまとめる
+        gtfs_info = None
+        if gtfs_position:
+            gtfs_info = {
+                "stop_sequence": gtfs_position.stop_sequence,
+                "status": gtfs_position.status
+            }
         
         if not state.is_stopped and gtfs_position is not None:
             try:
@@ -792,7 +830,8 @@ def get_blended_train_positions(
             state, 
             cache, 
             override_progress=blended_progress,
-            data_quality=data_quality
+            data_quality=data_quality,
+            gtfs_info=gtfs_info  # ★ GTFS情報を渡す
         )
         
         if position:

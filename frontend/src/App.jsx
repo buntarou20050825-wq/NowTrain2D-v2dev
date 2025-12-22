@@ -169,6 +169,7 @@ function App() {
               <tr style="border-top: 1px solid #eee;"><td colspan="2" style="padding-top: 4px;"><b>時刻情報</b></td></tr>
               <tr><td><b>${props.isStopped === 'true' || props.isStopped === true ? '到着時刻' : '前駅発車'}:</b></td><td>${formatTime(props.departureTimeRaw)}</td></tr>
               <tr><td><b>${props.isStopped === 'true' || props.isStopped === true ? '発車予定' : '次駅到着'}:</b></td><td>${formatTime(props.arrivalTimeRaw)}</td></tr>
+              ${parseInt(props.delaySeconds) >= 60 ? `<tr><td><b style="color: ${parseInt(props.delaySeconds) >= 300 ? '#FF4500' : '#FFA500'}">遅延:</b></td><td style="color: ${parseInt(props.delaySeconds) >= 300 ? '#FF4500' : '#FFA500'}; font-weight: bold;">+${Math.floor(parseInt(props.delaySeconds) / 60)}分</td></tr>` : ''}
               <tr style="border-top: 1px solid #eee;"><td colspan="2" style="padding-top: 4px;"><b>座標</b></td></tr>
               <tr><td><b>現在位置:</b></td><td>${parseFloat(coords[1]).toFixed(5)}, ${parseFloat(coords[0]).toFixed(5)}</td></tr>
             </table>
@@ -408,26 +409,16 @@ function App() {
               // 追跡中は赤
               ["==", ["get", "trainNumber"], trackedTrain || ""],
               "#FF0000",
-              // dataQuality: good (ブレンド成功) = 青
-              ["==", ["get", "dataQuality"], "good"],
-              "#2196F3",
-              // dataQuality: stale (古いGTFS-RT) = 水色
-              ["==", ["get", "dataQuality"], "stale"],
-              "#00BCD4",
-              // dataQuality: rejected (乖離大) = 紫
+              // dataQuality: rejected (無効) = 紫
               ["==", ["get", "dataQuality"], "rejected"],
               "#9C27B0",
-              // dataQuality: timetable_only = 黄色
-              ["==", ["get", "dataQuality"], "timetable_only"],
-              "#FFEB3B",
-              // 停車中（外回り）は緑
-              ["all", ["==", ["get", "isStopped"], true], ["==", ["get", "direction"], "OuterLoop"]],
-              "#80C342",
-              // 停車中（内回り）はオレンジ
-              ["all", ["==", ["get", "isStopped"], true], ["==", ["get", "direction"], "InnerLoop"]],
-              "#FF9500",
-              // フォールバック
-              "#80C342",
+              // MS6: 遅延による色分け（step式）
+              ["step",
+                ["get", "delaySeconds"],
+                "#00B140", // 0~59秒: 緑（定刻）
+                60, "#FFA500", // 60~299秒: オレンジ（1~5分遅れ）
+                300, "#FF4500" // 300秒~: 赤（5分以上遅れ）
+              ]
             ],
             "circle-opacity": 0.9,
           },
@@ -582,6 +573,8 @@ function App() {
               fromStation: p.segment?.prev_station_id || null,
               toStation: p.segment?.next_station_id || null,
               stationId: p.status === 'stopped' ? p.segment?.prev_station_id : null,
+              // MS6: 遅延情報
+              delay: p.delay || 0,
               // 比較座標（v4では同じ座標を使う）
               timetableLatitude: null,
               timetableLongitude: null,
@@ -692,6 +685,8 @@ function App() {
             // 時刻情報（v4 API）
             departureTimeRaw: train.departureTime,
             arrivalTimeRaw: train.nextArrivalTime,
+            // MS6: 遅延情報
+            delaySeconds: train.delay || 0,
             // 比較座標（v4ではない）
             timetableLat: train.timetableLatitude,
             timetableLon: train.timetableLongitude,

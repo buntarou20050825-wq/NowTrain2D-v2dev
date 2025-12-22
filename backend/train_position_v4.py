@@ -48,6 +48,7 @@ class SegmentProgress:
     # デバッグ用
     feed_timestamp: Optional[int] = None
     segment_count: int = 0         # 全区間数
+    delay: int = 0                 # MS6: 遅延秒数
 
 
 # ============================================================================
@@ -144,6 +145,7 @@ def compute_progress_for_train(
             status="invalid",
             feed_timestamp=schedule.feed_timestamp,
             segment_count=0,
+            delay=0,
         )
     
     # 3. 停車判定（各駅の arrival <= now <= departure をチェック）
@@ -165,6 +167,7 @@ def compute_progress_for_train(
                 status="stopped",
                 feed_timestamp=schedule.feed_timestamp,
                 segment_count=len(seqs) - 1,
+                delay=stu.delay,  # MS6: 停車中はその駅の遅延
             )
     
     # 4. 区間判定（走行中）
@@ -213,6 +216,7 @@ def compute_progress_for_train(
                 status="running",
                 feed_timestamp=schedule.feed_timestamp,
                 segment_count=len(seqs) - 1,
+                delay=next_stu.delay,  # MS6: 走行中は次駅到着遅延
             )
     
     # 5. 区間も停車も見つからない → unknown
@@ -243,6 +247,7 @@ def compute_progress_for_train(
         status="unknown",
         feed_timestamp=schedule.feed_timestamp,
         segment_count=len(seqs) - 1,
+        delay=0,
     )
 
 

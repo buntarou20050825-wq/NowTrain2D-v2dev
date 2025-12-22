@@ -43,6 +43,7 @@ class RealtimeStationSchedule:
     departure_time: Optional[int]    # unix timestamp (seconds)
     resolved: bool                   # station_id が静的/stop_idから解決できたか
     raw_stop_id: Optional[str]       # TripUpdate側の stop_id（あれば）
+    delay: int = 0                   # MS6: 遅延秒数 (デフォルト0)
 
 
 @dataclass
@@ -195,6 +196,13 @@ async def fetch_trip_updates(
             if stu.HasField("departure") and stu.departure.HasField("time"):
                 departure_time = stu.departure.time
             
+            # MS6: 遅延情報の抽出
+            delay = 0
+            if stu.HasField("arrival") and stu.arrival.HasField("delay"):
+                delay = stu.arrival.delay
+            elif stu.HasField("departure") and stu.departure.HasField("delay"):
+                delay = stu.departure.delay
+            
             # 到着も発車も無いレコードはスキップ
             if arrival_time is None and departure_time is None:
                 continue
@@ -211,6 +219,7 @@ async def fetch_trip_updates(
                 departure_time=departure_time,
                 resolved=resolved,
                 raw_stop_id=raw_stop_id,
+                delay=delay,
             )
         
         # 10. ordered_sequences を作成（昇順ソート）

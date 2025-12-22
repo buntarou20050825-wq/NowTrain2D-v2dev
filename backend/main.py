@@ -637,6 +637,7 @@ async def get_yamanote_positions_v4():
                 "direction": r.direction,
                 "status": r.status,
                 "progress": round(r.progress, 4) if r.progress is not None else None,
+                "delay": r.delay,  # MS6: 遅延秒数
                 
                 "location": {
                     "latitude": round(lat, 6) if lat is not None else None,

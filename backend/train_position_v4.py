@@ -15,6 +15,11 @@ from gtfs_rt_tripupdate import TrainSchedule, RealtimeStationSchedule
 
 logger = logging.getLogger(__name__)
 
+# Mini Tokyo 3D方式: arrival == departure の場合のデフォルト停車時間（秒）
+# 参考: https://internet.watch.impress.co.jp/docs/interview/1434086.html
+# 「最も誤差が少ないと思われる"毎分25秒"を基準にしました」
+DEFAULT_STOP_DURATION = 25
+
 
 # ============================================================================
 # Data Models
@@ -73,13 +78,18 @@ def _is_stopped_at_station(
 ) -> bool:
     """
     現在時刻がこの駅の到着〜発車の間にあるか判定。
+    
+    arrival == departure の場合は、Mini Tokyo 3D方式で
+    DEFAULT_STOP_DURATION（25秒）の停車時間を仮定する。
     """
     arr = schedule.arrival_time
     dep = schedule.departure_time
     
     # 両方ある場合
     if arr is not None and dep is not None:
-        return arr <= now_ts <= dep
+        # ★ arrival == departure の場合は 25秒の停車時間を仮定
+        effective_dep = dep if arr != dep else arr + DEFAULT_STOP_DURATION
+        return arr <= now_ts <= effective_dep
     
     return False
 

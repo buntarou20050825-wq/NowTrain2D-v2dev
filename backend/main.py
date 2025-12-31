@@ -200,12 +200,19 @@ async def get_stations(
         if isinstance(coord_raw, (list, tuple)) and len(coord_raw) >= 2:
             lon, lat = coord_raw[0], coord_raw[1]
 
+        station_id = raw.get("id")
+        rank_entry = data_cache.station_rank_cache.get(station_id) if station_id else None
+        rank = rank_entry.get("rank") if rank_entry else "B"
+        dwell_time = rank_entry.get("dwell_time") if rank_entry else data_cache.get_station_dwell_time(station_id)
+
         return {
-            "id": raw.get("id"),
+            "id": station_id,
             "line_id": raw.get("railway"),
             "name_ja": title.get("ja", ""),
             "name_en": title.get("en", ""),
             "coord": {"lon": lon, "lat": lat},
+            "rank": rank,
+            "dwell_time": dwell_time,
         }
 
     return {"stations": [to_station(st) for st in stations]}

@@ -1,7 +1,7 @@
 # backend/main.py
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 from dotenv import load_dotenv
@@ -9,13 +9,16 @@ import os
 import logging
 from typing import Any, Dict, List, Optional
 from dataclasses import asdict
+from pydantic import BaseModel
 
 import httpx
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from sqlalchemy.orm import Session
 
 from data_cache import DataCache
 from config import get_line_config  # MS10: 路線設定のインポート
+from database import SessionLocal, StationRank
 
 # GTFS解析 & 列車位置計算 (MS11: 汎用化)
 try:
@@ -39,6 +42,17 @@ BASE_DIR = Path(__file__).resolve().parent.parent  # NowTrain-v2/
 DATA_DIR = BASE_DIR / "data"
 
 data_cache = DataCache(DATA_DIR)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+class StationRankUpdate(BaseModel):
+    rank: str
+    dwell_time: int
 
 
 # MS11: ID解決用ヘルパー関数
@@ -186,15 +200,67 @@ async def get_stations(
         if isinstance(coord_raw, (list, tuple)) and len(coord_raw) >= 2:
             lon, lat = coord_raw[0], coord_raw[1]
 
+        station_id = raw.get("id")
+        rank_entry = data_cache.station_rank_cache.get(station_id) if station_id else None
+        rank = rank_entry.get("rank") if rank_entry else "B"
+        dwell_time = rank_entry.get("dwell_time") if rank_entry else data_cache.get_station_dwell_time(station_id)
+
         return {
-            "id": raw.get("id"),
+            "id": station_id,
             "line_id": raw.get("railway"),
             "name_ja": title.get("ja", ""),
             "name_en": title.get("en", ""),
             "coord": {"lon": lon, "lat": lat},
+            "rank": rank,
+            "dwell_time": dwell_time,
         }
 
     return {"stations": [to_station(st) for st in stations]}
+
+
+
+
+
+@app.put("/api/stations/{station_id}/rank")
+async def update_station_rank(
+    station_id: str,
+    update_data: StationRankUpdate,
+    db: Session = Depends(get_db),
+):
+    if update_data.dwell_time < 0:
+        raise HTTPException(status_code=400, detail="dwell_time must be >= 0")
+    if update_data.rank not in {"S", "A", "B"}:
+        raise HTTPException(status_code=400, detail="rank must be one of: S, A, B")
+
+    rank_obj = db.query(StationRank).filter(StationRank.station_id == station_id).first()
+
+    if not rank_obj:
+        rank_obj = StationRank(station_id=station_id)
+        db.add(rank_obj)
+
+    rank_obj.rank = update_data.rank
+    rank_obj.dwell_time = update_data.dwell_time
+
+    db.commit()
+    db.refresh(rank_obj)
+
+    data_cache.station_rank_cache[station_id] = {
+        "rank": rank_obj.rank,
+        "dwell_time": rank_obj.dwell_time,
+    }
+
+    logger.info(
+        "Station Rank Updated: %s -> %s (%ds)",
+        station_id,
+        update_data.rank,
+        update_data.dwell_time,
+    )
+
+    return {"status": "success", "data": {
+        "station_id": rank_obj.station_id,
+        "rank": rank_obj.rank,
+        "dwell_time": rank_obj.dwell_time,
+    }}
 
 
 # backend/main.py の get_shapes 関数を以下のように書き換えてください
@@ -660,7 +726,7 @@ async def get_yamanote_positions_v4():
             }
         
         # 2. MS2: 進捗計算
-        results = compute_all_progress(schedules)
+        results = compute_all_progress(schedules, data_cache=data_cache)
         
         # 3. レスポンス構築
         positions = []
@@ -796,7 +862,7 @@ async def get_train_positions_v4(line_id: str):
             }
         
         # 3. MS2: 進捗計算
-        results = compute_all_progress(schedules)
+        results = compute_all_progress(schedules, data_cache=data_cache)
         
         # 4. レスポンス構築
         positions = []

@@ -10,8 +10,10 @@ from timetable_models import StopTime, TimetableTrain
 from train_state import TrainSegment, build_yamanote_segments
 try:
     from .database import SessionLocal, Station, StationRank
+    from .station_ranks import get_station_dwell_time as get_static_dwell_time
 except ImportError:
     from database import SessionLocal, Station, StationRank
+    from station_ranks import get_station_dwell_time as get_static_dwell_time
 
 logger = logging.getLogger(__name__)
 
@@ -297,6 +299,9 @@ class DataCache:
         # MS3-3: 駅座標インデックス
         self.station_positions: Dict[str, tuple[float, float]] = {}
 
+        # 駅ランクキャッシュ (station_id -> {"rank": str, "dwell_time": int})
+        self.station_rank_cache: Dict[str, Dict[str, Any]] = {}
+
         # MS3-5: 線路形状追従用
         self.track_points: List[tuple[float, float]] = []  # 山手線全周の座標リスト
         self.station_track_indices: Dict[str, int] = {}    # 駅ID → track_pointsのインデックス
@@ -363,6 +368,9 @@ class DataCache:
 
         # MS3-3: 駅座標インデックスの構築 (DBから)
         self.load_station_positions_from_db()
+
+        # 駅ランクの読み込み (DBから)
+        self.load_station_ranks_from_db()
 
         # MS3-5: 線路形状データの読み込みと駅マッピング
         self._load_track_coordinates()
@@ -588,6 +596,17 @@ class DataCache:
                 return None
             return {"rank": r.rank, "dwell_time": r.dwell_time}
 
+    def get_station_dwell_time(self, station_id: str | None) -> int:
+        """
+        駅IDから停車時間を取得する (DBキャッシュ優先)。
+        """
+        if not station_id:
+            return get_static_dwell_time(station_id)
+        cached = self.station_rank_cache.get(station_id)
+        if cached:
+            return int(cached.get("dwell_time", get_static_dwell_time(station_id)))
+        return get_static_dwell_time(station_id)
+
     def load_station_positions_from_db(self) -> None:
         """DBから駅座標キャッシュを構築する (Step 2)"""
         self.station_positions.clear()
@@ -604,8 +623,44 @@ class DataCache:
         
         logger.info("Loaded %d station positions from DB", len(self.station_positions))
 
+    def load_station_ranks_from_db(self) -> None:
+        """DBから駅ランクキャッシュを構築する"""
+        self.station_rank_cache.clear()
+        with SessionLocal() as db:
+            rows = db.query(StationRank.station_id, StationRank.rank, StationRank.dwell_time).all()
+            for station_id, rank, dwell_time in rows:
+                if not station_id:
+                    continue
+                self.station_rank_cache[station_id] = {
+                    "rank": rank,
+                    "dwell_time": int(dwell_time),
+                }
+        logger.info("Loaded %d station ranks from DB", len(self.station_rank_cache))
+
     def get_station_coord(self, station_id: str) -> tuple[float, float] | None:
         """
         駅座標を取得する (Unified Accessor)
         """
         return self.station_positions.get(station_id)
+
+    def update_station_rank(self, station_id: str, rank: str, dwell_time: int) -> None:
+        """
+        駅ランク情報を更新する (Upsert)
+        """
+        with SessionLocal() as db:
+            # 既に存在するか確認
+            existing = db.query(StationRank).filter(StationRank.station_id == station_id).first()
+            if existing:
+                existing.rank = rank
+                existing.dwell_time = dwell_time
+            else:
+                new_rank = StationRank(station_id=station_id, rank=rank, dwell_time=dwell_time)
+                db.add(new_rank)
+            
+            db.commit()
+            logger.info(f"Updated station rank for {station_id}: rank={rank}, dwell={dwell_time}")
+
+        self.station_rank_cache[station_id] = {
+            "rank": rank,
+            "dwell_time": int(dwell_time),
+        }

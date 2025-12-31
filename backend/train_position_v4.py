@@ -10,10 +10,13 @@ import logging
 import math
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TYPE_CHECKING
 from station_ranks import get_station_dwell_time
 
 from gtfs_rt_tripupdate import TrainSchedule, RealtimeStationSchedule
+
+if TYPE_CHECKING:
+    from data_cache import DataCache
 
 logger = logging.getLogger(__name__)
 
@@ -100,12 +103,27 @@ def _extract_station_rank_key(value: Optional[str]) -> Optional[str]:
     return None
 
 
-def _get_dwell_seconds(schedule: RealtimeStationSchedule) -> int:
-    key = _extract_station_rank_key(schedule.raw_stop_id) or _extract_station_rank_key(schedule.station_id)
-    return get_station_dwell_time(key if key is not None else schedule.station_id)
+def _get_dwell_seconds(
+    schedule: RealtimeStationSchedule,
+    data_cache: "DataCache" | None = None,
+) -> int:
+    if data_cache and schedule.station_id:
+        return data_cache.get_station_dwell_time(schedule.station_id)
+
+    if schedule.station_id:
+        return get_station_dwell_time(schedule.station_id)
+
+    raw_key = _extract_station_rank_key(schedule.raw_stop_id)
+    if raw_key:
+        return get_station_dwell_time(raw_key)
+
+    return get_station_dwell_time(schedule.station_id)
 
 
-def _get_departure_time(schedule: RealtimeStationSchedule) -> Optional[int]:
+def _get_departure_time(
+    schedule: RealtimeStationSchedule,
+    data_cache: "DataCache" | None = None,
+) -> Optional[int]:
     """
     発車時刻を取得する。
     arrival == departure の場合（GTFS時刻表の仕様）は、
@@ -118,7 +136,7 @@ def _get_departure_time(schedule: RealtimeStationSchedule) -> Optional[int]:
     if arr is not None and dep is not None:
         # 時刻表上で到着=発車となっている場合、停車時間を足して「実質発車時刻」を作る
         if arr == dep:
-            dwell = _get_dwell_seconds(schedule)
+            dwell = _get_dwell_seconds(schedule, data_cache)
             return arr + dwell
         return dep
         
@@ -128,7 +146,7 @@ def _get_departure_time(schedule: RealtimeStationSchedule) -> Optional[int]:
         
     # arrivalだけある（稀なケース）
     if arr is not None:
-        dwell = _get_dwell_seconds(schedule)
+        dwell = _get_dwell_seconds(schedule, data_cache)
         return arr + dwell
 
     return None
@@ -136,6 +154,7 @@ def _get_departure_time(schedule: RealtimeStationSchedule) -> Optional[int]:
 def _is_stopped_at_station(
     schedule: RealtimeStationSchedule,
     now_ts: int,
+    data_cache: "DataCache" | None = None,
 ) -> bool:
     """
     現在時刻がこの駅の到着〜発車の間にあるか判定。
@@ -143,7 +162,7 @@ def _is_stopped_at_station(
     arr = schedule.arrival_time
     
     # 統一ロジックを使って発車時刻を取得
-    effective_dep = _get_departure_time(schedule)
+    effective_dep = _get_departure_time(schedule, data_cache)
     
     if arr is not None and effective_dep is not None:
         return arr <= now_ts <= effective_dep
@@ -166,6 +185,7 @@ def _get_arrival_time(schedule: RealtimeStationSchedule) -> Optional[int]:
 def compute_progress_for_train(
     schedule: TrainSchedule,
     now_ts: Optional[int] = None,
+    data_cache: "DataCache" | None = None,
 ) -> SegmentProgress:
     """
     単一列車の現在位置・進捗を計算する。
@@ -215,7 +235,7 @@ def compute_progress_for_train(
     # 3. 停車判定（各駅の arrival <= now <= departure をチェック）
     for seq in seqs:
         stu = schedules_by_seq.get(seq)
-        if stu and _is_stopped_at_station(stu, now_ts):
+        if stu and _is_stopped_at_station(stu, now_ts, data_cache):
             return SegmentProgress(
                 trip_id=trip_id,
                 train_number=train_number,
@@ -247,7 +267,7 @@ def compute_progress_for_train(
             continue
         
         # t0 = 前駅の発車時刻、t1 = 次駅の到着時刻
-        t0 = _get_departure_time(prev_stu)
+        t0 = _get_departure_time(prev_stu, data_cache)
         t1 = _get_arrival_time(next_stu)
         
         # 両方存在チェック
@@ -318,6 +338,7 @@ def compute_progress_for_train(
 def compute_all_progress(
     schedules: Dict[str, TrainSchedule],
     now_ts: Optional[int] = None,
+    data_cache: "DataCache" | None = None,
 ) -> List[SegmentProgress]:
     """
     複数列車の現在位置・進捗をまとめて計算する。
@@ -337,7 +358,7 @@ def compute_all_progress(
     
     for trip_id, schedule in schedules.items():
         try:
-            progress = compute_progress_for_train(schedule, now_ts)
+            progress = compute_progress_for_train(schedule, now_ts, data_cache)
             results.append(progress)
         except Exception as e:
             logger.error(f"Failed to compute progress for {trip_id}: {e}")

@@ -17,12 +17,6 @@ from gtfs_rt_tripupdate import TrainSchedule, RealtimeStationSchedule
 
 logger = logging.getLogger(__name__)
 
-# Mini Tokyo 3D方式: arrival == departure の場合のデフォルト停車時間（秒）
-# 参考: https://internet.watch.impress.co.jp/docs/interview/1434086.html
-# 「最も誤差が少ないと思われる"毎分25秒"を基準にしました」
-DEFAULT_STOP_DURATION = 25
-
-
 # ============================================================================
 # MS8: 物理演算ベースの台形速度制御 (E235系)
 # ============================================================================
@@ -92,6 +86,25 @@ class SegmentProgress:
 # Helper Functions
 # ============================================================================
 
+def _extract_station_rank_key(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    s = str(value)
+    if s.isdigit():
+        return s
+    for sep in (".", ":"):
+        if sep in s:
+            tail = s.split(sep)[-1]
+            if tail.isdigit():
+                return tail
+    return None
+
+
+def _get_dwell_seconds(schedule: RealtimeStationSchedule) -> int:
+    key = _extract_station_rank_key(schedule.raw_stop_id) or _extract_station_rank_key(schedule.station_id)
+    return get_station_dwell_time(key if key is not None else schedule.station_id)
+
+
 def _get_departure_time(schedule: RealtimeStationSchedule) -> Optional[int]:
     """
     発車時刻を取得する。
@@ -105,7 +118,7 @@ def _get_departure_time(schedule: RealtimeStationSchedule) -> Optional[int]:
     if arr is not None and dep is not None:
         # 時刻表上で到着=発車となっている場合、停車時間を足して「実質発車時刻」を作る
         if arr == dep:
-            dwell = get_station_dwell_time(schedule.station_id)
+            dwell = _get_dwell_seconds(schedule)
             return arr + dwell
         return dep
         
@@ -115,7 +128,7 @@ def _get_departure_time(schedule: RealtimeStationSchedule) -> Optional[int]:
         
     # arrivalだけある（稀なケース）
     if arr is not None:
-        dwell = get_station_dwell_time(schedule.station_id)
+        dwell = _get_dwell_seconds(schedule)
         return arr + dwell
 
     return None
@@ -144,28 +157,6 @@ def _get_arrival_time(schedule: RealtimeStationSchedule) -> Optional[int]:
     if schedule.arrival_time is not None:
         return schedule.arrival_time
     return schedule.departure_time
-
-
-def _is_stopped_at_station(
-    schedule: RealtimeStationSchedule,
-    now_ts: int,
-) -> bool:
-    """
-    現在時刻がこの駅の到着〜発車の間にあるか判定。
-    
-    arrival == departure の場合は、Mini Tokyo 3D方式で
-    DEFAULT_STOP_DURATION（25秒）の停車時間を仮定する。
-    """
-    arr = schedule.arrival_time
-    dep = schedule.departure_time
-    
-    # 両方ある場合
-    if arr is not None and dep is not None:
-        # ★ arrival == departure の場合は 25秒の停車時間を仮定
-        effective_dep = dep if arr != dep else arr + DEFAULT_STOP_DURATION
-        return arr <= now_ts <= effective_dep
-    
-    return False
 
 
 # ============================================================================
@@ -398,91 +389,210 @@ def debug_progress_stats(results: List[SegmentProgress]) -> Dict[str, int]:
 # MS5: Track-Following Coordinate Calculation
 # ============================================================================
 
+# ============================================================================
+# Helpers for MS3
+# ============================================================================
+_SHAPE_CACHE: Dict[str, List[tuple[float, float]]] = {}
+
+def get_distance_meters(lat1, lon1, lat2, lon2):
+    """Haversine formula"""
+    R = 6371000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2) * math.sin(dlambda/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c
+
+def get_merged_coords(cache, line_id) -> List[tuple[float, float]]:
+    if line_id in _SHAPE_CACHE:
+        return _SHAPE_CACHE[line_id]
+    
+    merged: List[List[float]] = []
+    # coordinates.json content is in cache.coordinates["railways"]
+    railways = cache.coordinates.get("railways", [])
+    for r in railways:
+        if r.get("id") == line_id:
+            previous_end = None
+            for sl in r.get("sublines", []):
+                coords = sl.get("coords") or []
+                if not coords:
+                    continue
+
+                # Match /api/shapes merge order to keep sublines continuous.
+                if previous_end is not None:
+                    first = coords[0]
+                    last = coords[-1]
+                    dist_to_first = (first[0] - previous_end[0]) ** 2 + (first[1] - previous_end[1]) ** 2
+                    dist_to_last = (last[0] - previous_end[0]) ** 2 + (last[1] - previous_end[1]) ** 2
+                    if dist_to_last < dist_to_first:
+                        coords = list(reversed(coords))
+
+                merged.extend(coords)
+                previous_end = coords[-1]
+            break
+            
+    # Convert to list of tuples (lon, lat)
+    merged_tuples = [(c[0], c[1]) for c in merged]
+    
+    if merged_tuples:
+        _SHAPE_CACHE[line_id] = merged_tuples
+        
+    return merged_tuples
+
+def _get_station_coord_v4(station_id, cache) -> Optional[tuple[float, float]]:
+    # Step 2: Unified accessor (DB-backed)
+    # cache.get_station_coord returns (lon, lat)
+    if hasattr(cache, "get_station_coord"):
+        c = cache.get_station_coord(station_id)
+        if c:
+             return (c[0], c[1])
+
+    # Fallback to direct access if method missing
+    coord = cache.station_positions.get(station_id)
+    if coord:
+        return (coord[0], coord[1])
+    return None
+
 def calculate_coordinates(
     progress_data: SegmentProgress,
     cache: "DataCache",
+    line_id: str,
 ) -> tuple[float, float] | None:
     """
-    MS5: SegmentProgress から座標を計算する（線路形状追従）。
-    
-    既存の _interpolate_coords を使用し、線路に沿った座標を返す。
+    MS3: SegmentProgress から座標を計算する（線路形状スナップ）。
     
     Args:
         progress_data: SegmentProgress（MS2の出力）
         cache: DataCache インスタンス
+        line_id: 路線ID (例: "JR-East.ChuoRapid")
         
     Returns:
         (latitude, longitude) のタプル。計算不能なら None。
-        ※ v4 API の location.latitude/longitude に対応するため (lat, lon) 順。
     """
-    from train_position import _interpolate_coords, _get_station_coord
     
     status = progress_data.status
     
     # 1) stopped: 停車駅の座標を返す
     if status == "stopped":
-        station_id = progress_data.prev_station_id
-        if not station_id:
-            station_id = progress_data.next_station_id
-        
+        station_id = progress_data.prev_station_id or progress_data.next_station_id
         if station_id:
-            coord = _get_station_coord(station_id, cache)
+            coord = _get_station_coord_v4(station_id, cache)
             if coord:
-                # _get_station_coord は (lon, lat) を返す
                 lon, lat = coord
-                return (lat, lon)  # v4 API用に (lat, lon) に変換
-        
+                return (lat, lon)
         return None
     
-    # 2) running: 線路形状に沿った補間
+    # 2) running: 線路スナップ
     if status == "running":
         progress = progress_data.progress
-        if progress is None:
-            return None
-        
         prev_station_id = progress_data.prev_station_id
         next_station_id = progress_data.next_station_id
-        direction = progress_data.direction
         
-        if not prev_station_id or not next_station_id:
+        if progress is None or not prev_station_id or not next_station_id:
             return None
-        
+
+        # --- 直線補間 (フォールバック用関数) ---
+        def linear_fallback():
+            c1 = _get_station_coord_v4(prev_station_id, cache)
+            c2 = _get_station_coord_v4(next_station_id, cache)
+            if c1 and c2:
+                lon1, lat1 = c1
+                lon2, lat2 = c2
+                lat = lat1 + (lat2 - lat1) * progress
+                lon = lon1 + (lon2 - lon1) * progress
+                return (lat, lon)
+            return None
+
         try:
-            # _interpolate_coords は (lon, lat) を返す
-            result = _interpolate_coords(
-                from_station_id=prev_station_id,
-                to_station_id=next_station_id,
-                progress=progress,
-                direction=direction or "OuterLoop",  # デフォルト
-                cache=cache,
-            )
-            
-            if result:
-                lon, lat = result
-                return (lat, lon)  # v4 API用に (lat, lon) に変換
-            
-            return None
-            
-        except Exception as e:
-            logger.warning(f"Track interpolation failed for {progress_data.train_number}: {e}")
-            
-            # フォールバック: 駅座標の直線補間
-            try:
-                prev_coord = _get_station_coord(prev_station_id, cache)
-                next_coord = _get_station_coord(next_station_id, cache)
+            # 線路点群の取得
+            coords = get_merged_coords(cache, line_id)
+            if not coords:
+                return linear_fallback()
+
+            # 前駅・次駅の座標
+            s_coord = _get_station_coord_v4(prev_station_id, cache)
+            e_coord = _get_station_coord_v4(next_station_id, cache)
+            if not s_coord or not e_coord:
+                return linear_fallback()
+
+            s_lon, s_lat = s_coord
+            e_lon, e_lat = e_coord
+
+            # 最近傍探索 (距離ガード: 500m)
+            idx_prev = -1
+            min_d_prev = float('inf')
+            idx_next = -1
+            min_d_next = float('inf')
+
+            # 単純全探索
+            for i, (lon, lat) in enumerate(coords):
+                d_prev = get_distance_meters(s_lat, s_lon, lat, lon)
+                if d_prev < min_d_prev:
+                    min_d_prev = d_prev
+                    idx_prev = i
                 
-                if prev_coord and next_coord:
-                    lon0, lat0 = prev_coord
-                    lon1, lat1 = next_coord
-                    
-                    lat = lat0 + (lat1 - lat0) * progress
-                    lon = lon0 + (lon1 - lon0) * progress
-                    
-                    return (lat, lon)
-            except Exception:
-                pass
+                d_next = get_distance_meters(e_lat, e_lon, lat, lon)
+                if d_next < min_d_next:
+                    min_d_next = d_next
+                    idx_next = i
+
+            if min_d_prev > 500 or min_d_next > 500:
+                # 駅が線路から遠すぎる
+                logger.debug(f"Stations too far from rail ({line_id}): {min_d_prev:.1f}m, {min_d_next:.1f}m")
+                return linear_fallback()
+
+            if idx_prev == idx_next:
+                return linear_fallback()
+
+            # パス切り出し
+            if idx_prev < idx_next:
+                path = coords[idx_prev : idx_next + 1]
+            else:
+                path = coords[idx_next : idx_prev + 1][::-1]
+
+            # パス長計算 & 位置特定
+            total_dist = 0.0
+            dists = [0.0]
+            for i in range(len(path) - 1):
+                p1 = path[i]
+                p2 = path[i+1]
+                d = get_distance_meters(p1[1], p1[0], p2[1], p2[0])
+                total_dist += d
+                dists.append(total_dist)
             
-            return None
-    
-    # 3) unknown / invalid: None を返す
+            if total_dist <= 0:
+                return linear_fallback()
+
+            target_dist = total_dist * progress
+
+            # target_dist に対応する区間を探す
+            found_idx = 0
+            for i in range(len(dists) - 1):
+                if dists[i] <= target_dist <= dists[i+1]:
+                    found_idx = i
+                    break
+            
+            # 区間内補間
+            d_start = dists[found_idx]
+            d_end = dists[found_idx+1]
+            seg_len = d_end - d_start
+            
+            if seg_len <= 0:
+                res_lon, res_lat = path[found_idx]
+                return (res_lat, res_lon)
+
+            ratio = (target_dist - d_start) / seg_len
+            p_start = path[found_idx]
+            p_end = path[found_idx+1]
+            
+            res_lon = p_start[0] + (p_end[0] - p_start[0]) * ratio
+            res_lat = p_start[1] + (p_end[1] - p_start[1]) * ratio
+            
+            return (res_lat, res_lon)
+
+        except Exception as e:
+            logger.debug(f"Snap failed for {line_id}, fallback: {e}")
+            return linear_fallback()
+
     return None

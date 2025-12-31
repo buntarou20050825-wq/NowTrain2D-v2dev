@@ -170,14 +170,14 @@ async def get_stations(
     target_id = resolve_line_id(target_param)
     logger.info(f"Resolving Stations ID: '{target_param}' -> '{target_id}'")
 
-    # 3. データ検索
+    # 3. データ検索 (FROM DB)
     exists = any(l.get("id") == target_id for l in data_cache.railways)
     if not exists:
         logger.warning(f"Station lookup failed: Line ID '{target_id}' not found in railways.")
         raise HTTPException(status_code=404, detail=f"Line not found: {target_param} -> {target_id}")
 
-    stations = [st for st in data_cache.stations if st.get("railway") == target_id]
-    logger.info(f"Found {len(stations)} stations for {target_id}")
+    stations = data_cache.get_stations_by_line(target_id)
+    logger.info(f"Found {len(stations)} stations for {target_id} (from DB)")
 
     def to_station(raw: Dict[str, Any]) -> Dict[str, Any]:
         title = raw.get("title", {})
@@ -320,6 +320,7 @@ async def get_yamanote_positions():
     api_key = os.getenv("ODPT_API_KEY", "").strip()
     
     try:
+        from gtfs_rt_vehicle import fetch_yamanote_positions
         positions = await fetch_yamanote_positions(api_key)
         
         return {
@@ -671,7 +672,7 @@ async def get_yamanote_positions_v4():
                 continue
             
             # MS5: 座標計算（線路形状追従）
-            coord = calculate_coordinates(r, data_cache)
+            coord = calculate_coordinates(r, data_cache, "JR-East.Yamanote")
             lat = coord[0] if coord else None
             lon = coord[1] if coord else None
             
@@ -806,7 +807,7 @@ async def get_train_positions_v4(line_id: str):
                 continue
             
             # MS5: 座標計算（線路形状追従）
-            coord = calculate_coordinates(r, data_cache)
+            coord = calculate_coordinates(r, data_cache, line_config.mt3d_id)
             lat = coord[0] if coord else None
             lon = coord[1] if coord else None
             

@@ -8,6 +8,10 @@ from typing import Any, Dict, List
 
 from timetable_models import StopTime, TimetableTrain
 from train_state import TrainSegment, build_yamanote_segments
+try:
+    from .database import SessionLocal, Station, StationRank
+except ImportError:
+    from database import SessionLocal, Station, StationRank
 
 logger = logging.getLogger(__name__)
 
@@ -318,12 +322,14 @@ class DataCache:
         """全ての静的データを読み込む（MS1+MS2+MS3-1 用）"""
         # 1) MS2 までのデータ
         self.railways = self._load_json("mini-tokyo-3d/railways.json")
-        self.stations = self._load_json("mini-tokyo-3d/stations.json")
+        # Step 2: Stop loading stations.json
+        # self.stations = self._load_json("mini-tokyo-3d/stations.json")
         self.coordinates = self._load_json("mini-tokyo-3d/coordinates.json")
 
-        logger.info("Loaded %d railways, %d stations", len(self.railways), len(self.stations))
+        logger.info("Loaded %d railways", len(self.railways))
 
         # 2) MS3-1: 山手線の時刻表
+        raw_yamanote = None
         try:
             raw_yamanote = self._load_json("mini-tokyo-3d/train-timetables/jreast-yamanote.json")
         except FileNotFoundError:
@@ -336,11 +342,12 @@ class DataCache:
                 "Please copy jreast-yamanote.json from mini-tokyo-3d/data/train-timetables "
                 "into data/train-timetables/."
             )
-            # MS3-1 では、時刻表が無くても他の API を動かせるように空で継続
-            self.yamanote_trains = []
-            return
+            logger.warning("Continuing without Yamanote timetable data.")
 
-        self.yamanote_trains = _parse_yamanote_timetables(raw_yamanote)
+        if raw_yamanote is not None:
+            self.yamanote_trains = _parse_yamanote_timetables(raw_yamanote)
+        else:
+            self.yamanote_trains = []
 
         logger.info("Loaded %d Yamanote timetable trains", len(self.yamanote_trains))
         if self.yamanote_trains:
@@ -354,32 +361,17 @@ class DataCache:
         # MS1-TripUpdate: 列車検索インデックスを構築
         self._build_train_lookup_index()
 
-        # MS3-3: 駅座標インデックスの構築
-        station_positions: Dict[str, tuple[float, float]] = {}
-
-        for st in self.stations:
-            station_id = st.get("id")
-            coord = st.get("coord")
-
-            if not station_id or not coord or len(coord) < 2:
-                continue
-
-            lon, lat = float(coord[0]), float(coord[1])
-            if not _is_valid_coord(lon, lat):
-                logger.warning(
-                    "Station %s has invalid coord %s; skipping", station_id, coord
-                )
-                continue
-
-            station_positions[station_id] = (lon, lat)
-
-        self.station_positions = station_positions
-        logger.info("Built %d station positions", len(self.station_positions))
+        # MS3-3: 駅座標インデックスの構築 (DBから)
+        self.load_station_positions_from_db()
 
         # MS3-5: 線路形状データの読み込みと駅マッピング
         self._load_track_coordinates()
 
         # MS3-3: 山手線時刻表の駅IDが station_positions に存在するか検証
+        if not self.yamanote_trains:
+            logger.info("Skipping Yamanote station position validation (no timetable data).")
+            return
+
         missing_station_ids: set[str] = set()
 
         for train in self.yamanote_trains:
@@ -561,3 +553,59 @@ class DataCache:
                 return seq_map
         
         return None
+
+    # ========================================================================
+    # MS12: SQLite DB Access
+    # ========================================================================
+    
+    def get_stations_by_line(self, line_id: str) -> List[Dict[str, Any]]:
+        """
+        DBから特定路線の駅リストを取得する。
+        既存のJSON互換形式（dict）で返す。
+        """
+        # SessionLocal() はリクエストごとに作るのが理想だが、
+        # ここでは簡易的にコンテキストマネージャで都度生成・破棄する。
+        # 高負荷時は session scope の管理を FastAPI の Dependency に寄せるべき。
+        with SessionLocal() as db:
+            rows = db.query(Station).filter(Station.line_id == line_id).all()
+            return [
+                {
+                    "id": s.id,
+                    "railway": s.line_id,
+                    "title": {"ja": s.name_ja, "en": s.name_en},
+                    "coord": [s.lon, s.lat] if s.lon is not None else [],
+                }
+                for s in rows
+            ]
+
+    def get_station_rank_data(self, station_id: str) -> Dict[str, Any] | None:
+        """
+        DBから駅ランクを取得する。
+        """
+        with SessionLocal() as db:
+            r = db.query(StationRank).filter(StationRank.station_id == station_id).first()
+            if not r:
+                return None
+            return {"rank": r.rank, "dwell_time": r.dwell_time}
+
+    def load_station_positions_from_db(self) -> None:
+        """DBから駅座標キャッシュを構築する (Step 2)"""
+        self.station_positions.clear()
+        with SessionLocal() as db:
+            # 高速化のため必要なカラムのみ取得
+            rows = db.query(Station.id, Station.lon, Station.lat).all()
+            for s_id, lon, lat in rows:
+                if lon is None or lat is None:
+                    continue
+                # 簡易チェック
+                if not _is_valid_coord(lon, lat):
+                    continue
+                self.station_positions[s_id] = (lon, lat)
+        
+        logger.info("Loaded %d station positions from DB", len(self.station_positions))
+
+    def get_station_coord(self, station_id: str) -> tuple[float, float] | None:
+        """
+        駅座標を取得する (Unified Accessor)
+        """
+        return self.station_positions.get(station_id)

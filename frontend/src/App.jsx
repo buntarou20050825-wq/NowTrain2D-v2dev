@@ -499,10 +499,12 @@ function App() {
 
         filteredPositions.forEach(p => {
           if (!p.location) return;
+          const { latitude, longitude } = p.location;
+          if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return;
           const key = p.train_number;
           activeKeys.add(key);
 
-          const newTarget = [p.location.longitude, p.location.latitude];
+          const newTarget = [longitude, latitude];
 
           // データ補正 (プロパティを扱いやすい形に)
           const props = {

@@ -46,40 +46,78 @@ def is_yamanote(trip_id: str) -> bool:
 
 def identify_route_by_trip_id(trip_id: str) -> str | None:
     """
-    trip_idのサフィックスから路線を推定する。
-    
+    trip_idのサフィックスから路線を推定する（後方互換性用）。
+    新規コードは identify_routes_by_trip_id() を使用してください。
+    """
+    routes = identify_routes_by_trip_id(trip_id)
+    return routes[0] if routes else None
+
+
+def identify_routes_by_trip_id(trip_id: str) -> list[str]:
+    """
+    trip_idのサフィックスから候補となる路線リストを返す。
+
+    ODPT APIのGTFS-RTはroute_idが空で返されるため、
+    trip_idの末尾文字から路線を推定する必要がある。
+    同じサフィックスが複数路線で使用されるため、リストで返す。
+
     JR東日本のtrip_id命名規則:
-    - G: 山手線 (JR-East.Yamanote)
-    - H/T: 中央線快速 (JR-East.ChuoRapid) - H=下り, T=上り
-    - A/B: 京浜東北・根岸線 (JR-East.KeihinTohokuNegishi)
-    - C: 総武線各駅停車 (JR-East.ChuoSobuLocal)
+    - G: 山手線
+    - H/T: 中央線快速, 横須賀線
+    - A/B: 京浜東北線, 中央・総武各駅停車
+    - C: 中央・総武各駅停車
+    - K: 横浜線, 埼京線
+    - F: 南武線, 埼京線, 総武快速線
+    - M: 常磐線, 京葉線, 東海道線, 総武本線 等
+    - Y: 横須賀線, 京葉線, 東海道線
+    - S: 埼京線, 横須賀線
+    - E: 武蔵野線, 東海道線
     """
     if not trip_id:
-        return None
-    
-    suffix = trip_id[-1] if trip_id else ""
-    
-    if suffix == 'G':
-        return "JR-East.Yamanote"
-    elif suffix in ('H', 'T'):
-        return "JR-East.ChuoRapid"
-    elif suffix in ('A', 'B'):
-        return "JR-East.KeihinTohokuNegishi"
-    elif suffix == 'C':
-        return "JR-East.ChuoSobuLocal"
-    
-    return None
+        return []
+
+    suffix = trip_id[-1].upper() if trip_id else ""
+
+    SUFFIX_TO_ROUTES = {
+        'G': ["JR-East.Yamanote"],
+        'H': ["JR-East.ChuoRapid", "JR-East.Yokosuka"],
+        'T': ["JR-East.ChuoRapid"],
+        'A': ["JR-East.KeihinTohokuNegishi", "JR-East.ChuoSobuLocal"],
+        'B': ["JR-East.KeihinTohokuNegishi", "JR-East.ChuoSobuLocal"],
+        'C': ["JR-East.ChuoSobuLocal"],
+        'K': ["JR-East.Yokohama", "JR-East.SaikyoKawagoe"],
+        'F': ["JR-East.Nambu", "JR-East.SaikyoKawagoe", "JR-East.SobuRapid"],
+        'M': ["JR-East.Joban", "JR-East.JobanRapid", "JR-East.SaikyoKawagoe",
+              "JR-East.Keiyo", "JR-East.Tokaido", "JR-East.Sobu", "JR-East.SobuRapid"],
+        'Y': ["JR-East.Yokosuka", "JR-East.Keiyo", "JR-East.Tokaido", "JR-East.ChuoSobuLocal"],
+        'S': ["JR-East.SaikyoKawagoe", "JR-East.Yokosuka"],
+        'E': ["JR-East.Musashino", "JR-East.Tokaido"],
+    }
+
+    return SUFFIX_TO_ROUTES.get(suffix, [])
 
 
-def get_direction(trip_id: str) -> str:
-    """方向を取得"""
+def get_direction(trip_id: str, route_id: str = None) -> str:
+    """
+    方向を取得する。
+
+    NOTE: この関数は山手線専用のプレフィックス判定を含みます。
+    他の路線では列車番号の偶奇で判定しますが、これはフォールバックであり
+    正確性は保証されません。
+
+    JR東日本の慣例:
+    - 奇数=下り（OuterLoop相当）
+    - 偶数=上り（InnerLoop相当）
+    """
+    # 山手線: プレフィックスで判定
     if trip_id.startswith('4201'):
         return 'OuterLoop'
     elif trip_id.startswith('4211'):
         return 'InnerLoop'
-    
+
     # Fallback: 列車番号の偶奇で判定
-    # 山手線: 外回り=奇数, 内回り=偶数
+    # JR一般路線: 下り=奇数, 上り=偶数
+    is_odd = None
     try:
         # trip_id の後半部分から数字を抽出 (例: "4200461G" -> "461")
         # プレフィックス4桁を除いた部分を使用
@@ -87,14 +125,44 @@ def get_direction(trip_id: str) -> str:
         num_part = ''.join(filter(str.isdigit, suffix))
         if num_part:
             num = int(num_part)
-            if num % 2 == 1:
-                return 'OuterLoop'
-            else:
-                return 'InnerLoop'
+            is_odd = (num % 2 == 1)
     except Exception:
         pass
-        
-    return 'Unknown'
+
+    if is_odd is None:
+        return 'Unknown'
+
+    # route_id がある場合、路線ごとの direction 名にマッピング
+    # 静的時刻表データの direction 値に合わせる
+    # 奇数=下り(Outbound系), 偶数=上り(Inbound系)
+    DIRECTION_MAP = {
+        # route_id: (奇数=下り, 偶数=上り)
+        "JR-East.Yamanote": ("OuterLoop", "InnerLoop"),
+        "JR-East.ChuoRapid": ("Outbound", "Inbound"),
+        "JR-East.KeihinTohokuNegishi": ("Southbound", "Northbound"),
+        "JR-East.ChuoSobuLocal": ("Westbound", "Eastbound"),
+        "JR-East.Yokohama": ("Outbound", "Inbound"),
+        "JR-East.SaikyoKawagoe": ("Northbound", "Southbound"),
+        "JR-East.Nambu": ("Outbound", "Inbound"),
+        "JR-East.Joban": ("Outbound", "Inbound"),
+        "JR-East.JobanRapid": ("Outbound", "Inbound"),
+        "JR-East.JobanLocal": ("Outbound", "Inbound"),
+        "JR-East.Keiyo": ("Outbound", "Inbound"),
+        "JR-East.Musashino": ("Outbound", "Inbound"),
+        "JR-East.SobuRapid": ("Outbound", "Inbound"),
+        "JR-East.Tokaido": ("Outbound", "Inbound"),
+        "JR-East.Yokosuka": ("Southbound", "Northbound"),
+        "JR-East.Takasaki": ("Outbound", "Inbound"),
+        "JR-East.Utsunomiya": ("Outbound", "Inbound"),
+        "JR-East.ShonanShinjuku": ("Southbound", "Northbound"),
+    }
+    
+    if route_id and route_id in DIRECTION_MAP:
+        outbound, inbound = DIRECTION_MAP[route_id]
+        return outbound if is_odd else inbound
+    
+    # デフォルト
+    return 'Outbound' if is_odd else 'Inbound'
 
 
 def get_train_number(trip_id: str) -> str:

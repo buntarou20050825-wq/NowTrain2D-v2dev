@@ -307,10 +307,14 @@ class DataCache:
         self.station_track_indices: Dict[str, int] = {}    # 駅ID → track_pointsのインデックス
 
         # MS1-TripUpdate: 列車番号から静的列車データへのインデックス
-        # key: (train_number, service_type), value: TimetableTrain
-        self._train_lookup: Dict[tuple[str, str], TimetableTrain] = {}
-        # key: (train_number, service_type), value: {stop_sequence: station_id}
-        self._seq_to_station_cache: Dict[tuple[str, str], Dict[int, str]] = {}
+        # key: (train_number, service_type, direction), value: TimetableTrain
+        self._train_lookup: Dict[tuple[str, str, str], TimetableTrain] = {}
+        # key: (train_number, service_type, direction), value: {stop_sequence: station_id}
+        self._seq_to_station_cache: Dict[tuple[str, str, str], Dict[int, str]] = {}
+
+        # 駅名検索用インデックス
+        # key: 駅名（日本語/英語）, value: 駅情報のリスト
+        self.station_search_index: List[Dict[str, Any]] = []
 
         # TODO (MS6): パフォーマンス最適化
         # self.railways_by_id: Dict[str, Dict[str, Any]] = {}
@@ -333,37 +337,60 @@ class DataCache:
 
         logger.info("Loaded %d railways", len(self.railways))
 
-        # 2) MS3-1: 山手線の時刻表
-        raw_yamanote = None
-        try:
-            raw_yamanote = self._load_json("mini-tokyo-3d/train-timetables/jreast-yamanote.json")
-        except FileNotFoundError:
-            logger.error(
-                "Yamanote timetable file not found. "
-                "Expected at: %s",
-                self.data_dir / "train-timetables/jreast-yamanote.json",
-            )
-            logger.error(
-                "Please copy jreast-yamanote.json from mini-tokyo-3d/data/train-timetables "
-                "into data/train-timetables/."
-            )
-            logger.warning("Continuing without Yamanote timetable data.")
-
-        if raw_yamanote is not None:
-            self.yamanote_trains = _parse_yamanote_timetables(raw_yamanote)
-        else:
-            self.yamanote_trains = []
-
-        logger.info("Loaded %d Yamanote timetable trains", len(self.yamanote_trains))
-        if self.yamanote_trains:
-            service_types = {t.service_type for t in self.yamanote_trains}
-            logger.info("Yamanote service types: %s", sorted(service_types))
+        # 2) 複数路線の時刻表をロード
+        # JR East の主要路線（ODPT API でサポートされている路線）
+        TIMETABLE_FILES = [
+            "jreast-yamanote.json",
+            "jreast-chuorapid.json",
+            "jreast-keihintohokunegishi.json",
+            "jreast-chuosobulocal.json",
+            "jreast-yokohama.json",
+            "jreast-saikyokawagoe.json",
+            "jreast-nambu.json",
+            "jreast-joban.json",
+            "jreast-jobanrapid.json",
+            "jreast-jobanlocal.json",
+            "jreast-keiyo.json",
+            "jreast-musashino.json",
+            "jreast-soburapid.json",
+            "jreast-tokaido.json",
+            "jreast-yokosuka.json",
+            "jreast-takasaki.json",
+            "jreast-utsunomiya.json",
+            "jreast-shonanshinjuku.json",
+        ]
+        
+        self.all_trains: List[TimetableTrain] = []
+        total_loaded = 0
+        
+        for filename in TIMETABLE_FILES:
+            try:
+                raw_data = self._load_json(f"mini-tokyo-3d/train-timetables/{filename}")
+                trains = _parse_yamanote_timetables(raw_data)  # Generic parser
+                self.all_trains.extend(trains)
+                total_loaded += len(trains)
+                logger.info("Loaded %d trains from %s", len(trains), filename)
+            except FileNotFoundError:
+                logger.warning("Timetable file not found: %s (skipping)", filename)
+            except Exception as e:
+                logger.error("Failed to load %s: %s", filename, e)
+        
+        logger.info("Loaded %d total timetable trains from %d files", 
+                    total_loaded, len(TIMETABLE_FILES))
+        
+        # 後方互換性のため yamanote_trains も維持
+        self.yamanote_trains = [t for t in self.all_trains if "Yamanote" in t.line_id]
+        logger.info("Of which %d are Yamanote trains", len(self.yamanote_trains))
+        
+        if self.all_trains:
+            service_types = {t.service_type for t in self.all_trains}
+            logger.info("Service types found: %s", sorted(service_types))
 
         # MS3-2: 山手線のセグメントを構築
         self.yamanote_segments = build_yamanote_segments(self.yamanote_trains)
         logger.info("Built %d Yamanote train segments", len(self.yamanote_segments))
 
-        # MS1-TripUpdate: 列車検索インデックスを構築
+        # MS1-TripUpdate: 列車検索インデックスを構築 (全路線対象)
         self._build_train_lookup_index()
 
         # MS3-3: 駅座標インデックスの構築 (DBから)
@@ -371,6 +398,9 @@ class DataCache:
 
         # 駅ランクの読み込み (DBから)
         self.load_station_ranks_from_db()
+
+        # 駅名検索インデックスの構築 (DBから)
+        self.build_station_search_index()
 
         # MS3-5: 線路形状データの読み込みと駅マッピング
         self._load_track_coordinates()
@@ -481,8 +511,9 @@ class DataCache:
         self._train_lookup.clear()
         self._seq_to_station_cache.clear()
 
-        for train in self.yamanote_trains:
-            key = (train.number, train.service_type)
+        for train in self.all_trains:
+            # direction を含めてキーを構築
+            key = (train.number, train.service_type, train.direction)
             
             # 同一キーが重複する場合は最初のものを使用
             if key not in self._train_lookup:
@@ -504,7 +535,7 @@ class DataCache:
         )
 
     def get_static_train(
-        self, train_number: str | None, service_type: str | None
+        self, train_number: str | None, service_type: str | None, direction: str | None = None
     ) -> TimetableTrain | None:
         """
         列車番号から静的時刻表データを検索する。
@@ -512,7 +543,7 @@ class DataCache:
         Args:
             train_number: 列車番号 (例: "301G")
             service_type: サービスタイプ (例: "Weekday", "SaturdayHoliday")
-                          指定されている場合は、そのタイプを優先する。
+            direction: 方向 (例: "Inbound", "Outbound")
         
         Returns:
             見つかった TimetableTrain、見つからない場合は None
@@ -520,21 +551,25 @@ class DataCache:
         if not train_number:
             return None
         
-        # 1. 完全一致を試す
-        if service_type:
-            result = self._train_lookup.get((train_number, service_type))
+        # 1. 完全一致を試す (direction 含む)
+        if service_type and direction:
+            result = self._train_lookup.get((train_number, service_type, direction))
             if result:
                 return result
         
-        # 2. サービスタイプ関係なく探す（最初に見つかったものを返す）
-        for (num, st), train in self._train_lookup.items():
+        # 2. フォールバック検索
+        for (num, st, d), train in self._train_lookup.items():
             if num == train_number:
+                if service_type and st != service_type:
+                    continue
+                if direction and d != direction:
+                    continue
                 return train
         
         return None
 
     def get_seq_to_station_map(
-        self, train_number: str | None, service_type: str | None
+        self, train_number: str | None, service_type: str | None, direction: str | None = None
     ) -> Dict[int, str] | None:
         """
         列車の stop_sequence -> station_id マップを取得する。
@@ -542,6 +577,7 @@ class DataCache:
         Args:
             train_number: 列車番号 (例: "301G")
             service_type: サービスタイプ (例: "Weekday")
+            direction: 方向 (例: "Inbound", "Outbound")
         
         Returns:
             {stop_sequence: station_id} のマップ、見つからない場合は None
@@ -550,14 +586,18 @@ class DataCache:
             return None
         
         # 1. 完全一致を試す
-        if service_type:
-            result = self._seq_to_station_cache.get((train_number, service_type))
+        if service_type and direction:
+            result = self._seq_to_station_cache.get((train_number, service_type, direction))
             if result:
                 return result
         
-        # 2. サービスタイプ関係なく探す
-        for (num, st), seq_map in self._seq_to_station_cache.items():
+        # 2. フォールバック検索
+        for (num, st, d), seq_map in self._seq_to_station_cache.items():
             if num == train_number:
+                if service_type and st != service_type:
+                    continue
+                if direction and d != direction:
+                    continue
                 return seq_map
         
         return None
@@ -570,21 +610,33 @@ class DataCache:
         """
         DBから特定路線の駅リストを取得する。
         既存のJSON互換形式（dict）で返す。
+        StationRankとも結合して、最新のランク情報を付与する。
         """
         # SessionLocal() はリクエストごとに作るのが理想だが、
         # ここでは簡易的にコンテキストマネージャで都度生成・破棄する。
-        # 高負荷時は session scope の管理を FastAPI の Dependency に寄せるべき。
         with SessionLocal() as db:
-            rows = db.query(Station).filter(Station.line_id == line_id).all()
-            return [
-                {
+            # Station と StationRank を左外部結合 (Outer Join)
+            rows = (
+                db.query(Station, StationRank)
+                .outerjoin(StationRank, Station.id == StationRank.station_id)
+                .filter(Station.line_id == line_id)
+                .all()
+            )
+            
+            result = []
+            for s, r in rows:
+                station_dict = {
                     "id": s.id,
                     "railway": s.line_id,
                     "title": {"ja": s.name_ja, "en": s.name_en},
                     "coord": [s.lon, s.lat] if s.lon is not None else [],
+                    # StationRank の値があれば使い、なければデフォルト
+                    "rank": r.rank if r else "B",
+                    "dwell_time": r.dwell_time if r else 20,
                 }
-                for s in rows
-            ]
+                result.append(station_dict)
+            
+            return result
 
     def get_station_rank_data(self, station_id: str) -> Dict[str, Any] | None:
         """
@@ -636,6 +688,103 @@ class DataCache:
                     "dwell_time": int(dwell_time),
                 }
         logger.info("Loaded %d station ranks from DB", len(self.station_rank_cache))
+
+    def build_station_search_index(self) -> None:
+        """
+        駅名検索用インデックスを構築する。
+        DBから全駅情報を取得し、検索に使いやすい形式でキャッシュする。
+        """
+        self.station_search_index.clear()
+
+        with SessionLocal() as db:
+            rows = db.query(
+                Station.id,
+                Station.line_id,
+                Station.name_ja,
+                Station.name_en,
+                Station.lon,
+                Station.lat
+            ).all()
+
+            # 同じ駅名で複数路線がある場合をグループ化
+            station_by_name: Dict[str, Dict[str, Any]] = {}
+
+            for s_id, line_id, name_ja, name_en, lon, lat in rows:
+                if lon is None or lat is None:
+                    continue
+                if not _is_valid_coord(lon, lat):
+                    continue
+
+                # 駅名をキーにグループ化（同じ駅でも路線が違う場合がある）
+                key = name_ja or name_en or s_id
+                if key not in station_by_name:
+                    station_by_name[key] = {
+                        "id": s_id,
+                        "name_ja": name_ja or "",
+                        "name_en": name_en or "",
+                        "coord": {"lon": lon, "lat": lat},
+                        "lines": [line_id] if line_id else [],
+                    }
+                else:
+                    # 同じ駅名で別路線がある場合、路線リストに追加
+                    if line_id and line_id not in station_by_name[key]["lines"]:
+                        station_by_name[key]["lines"].append(line_id)
+
+            # リスト形式に変換
+            self.station_search_index = list(station_by_name.values())
+
+        logger.info("Built station search index with %d stations", len(self.station_search_index))
+
+    def search_stations_by_name(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        駅名で駅を検索する（部分一致）。
+
+        Args:
+            query: 検索キーワード（日本語または英語）
+            limit: 最大件数
+
+        Returns:
+            マッチした駅のリスト
+        """
+        if not query:
+            return []
+
+        query_lower = query.lower()
+        results = []
+
+        for station in self.station_search_index:
+            name_ja = station.get("name_ja", "")
+            name_en = station.get("name_en", "")
+
+            # 完全一致を優先、次に部分一致
+            if name_ja == query or name_en.lower() == query_lower:
+                results.insert(0, station)  # 完全一致は先頭に
+            elif query in name_ja or query_lower in name_en.lower():
+                results.append(station)
+
+            if len(results) >= limit:
+                break
+
+        return results[:limit]
+
+    def get_station_coord_by_name(self, name: str) -> tuple[float, float] | None:
+        """
+        駅名から座標を取得する。
+
+        Args:
+            name: 駅名（日本語または英語）
+
+        Returns:
+            (lat, lon) タプル。見つからない場合は None。
+        """
+        results = self.search_stations_by_name(name, limit=1)
+        if results:
+            coord = results[0].get("coord", {})
+            lat = coord.get("lat")
+            lon = coord.get("lon")
+            if lat is not None and lon is not None:
+                return (lat, lon)
+        return None
 
     def get_station_coord(self, station_id: str) -> tuple[float, float] | None:
         """

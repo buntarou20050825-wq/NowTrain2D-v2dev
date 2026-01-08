@@ -20,6 +20,15 @@ from data_cache import DataCache
 from config import get_line_config  # MS10: 路線設定のインポート
 from database import SessionLocal, StationRank
 
+# OTP クライアント（経路検索用）
+try:
+    from otp_client import search_route as otp_search_route, parse_otp_response, extract_trip_ids
+except ImportError as e:
+    logging.warning(f"OTP client import failed: {e}. Route search will not work.")
+    otp_search_route = None
+    parse_otp_response = None
+    extract_trip_ids = None
+
 # GTFS解析 & 列車位置計算 (MS11: 汎用化)
 try:
     from gtfs_rt_tripupdate import fetch_trip_updates
@@ -218,6 +227,30 @@ async def get_stations(
     return {"stations": [to_station(st) for st in stations]}
 
 
+@app.get("/api/stations/search")
+async def search_stations(
+    q: str = Query(..., min_length=1, description="検索キーワード（日本語または英語）"),
+    limit: int = Query(10, ge=1, le=50, description="最大件数")
+):
+    """
+    駅名で駅を検索する（部分一致）
+
+    Args:
+        q: 検索キーワード
+        limit: 最大件数（デフォルト10、最大50）
+
+    Returns:
+        マッチした駅のリスト
+    """
+    logger.info(f"GET /api/stations/search called with q={q}, limit={limit}")
+
+    results = data_cache.search_stations_by_name(q, limit=limit)
+
+    return {
+        "query": q,
+        "count": len(results),
+        "stations": results
+    }
 
 
 
@@ -263,7 +296,287 @@ async def update_station_rank(
     }}
 
 
-# backend/main.py の get_shapes 関数を以下のように書き換えてください
+# ============================================================
+# 線路座標マージ関数 (MS12: sublinesマージロジック改善)
+# ============================================================
+
+def build_all_railways_cache(coordinates: Dict) -> Dict[str, List[List[float]]]:
+    """
+    全路線の座標をキャッシュに格納（Base路線含む）
+    type=subの参照解決に使用する。
+
+    Returns:
+        { "Base.TabataShinagawa": [[lon, lat], ...], "JR-East.Utsunomiya": [...], ... }
+    """
+    cache: Dict[str, List[List[float]]] = {}
+    for railway in coordinates.get("railways", []):
+        railway_id = railway.get("id", "")
+        sublines = railway.get("sublines", [])
+
+        # 全sublineの座標を結合
+        all_coords: List[List[float]] = []
+        for sub in sublines:
+            coords = sub.get("coords", [])
+            all_coords.extend(coords)
+
+        if all_coords:
+            cache[railway_id] = all_coords
+
+    return cache
+
+
+def resolve_subline_coords(
+    subline: Dict,
+    all_railways_cache: Dict[str, List[List[float]]]
+) -> List[List[float]]:
+    """
+    sublineの座標を解決する。
+    - type=main: subline自身のcoordsを返す
+    - type=sub: 参照先の路線の座標を返す（始点・終点で切り出し）
+
+    Args:
+        subline: coordinates.jsonのsublineオブジェクト
+        all_railways_cache: 全路線の座標キャッシュ
+
+    Returns:
+        解決された座標リスト
+    """
+    subtype = subline.get("type", "main")
+    coords = subline.get("coords", [])
+
+    # mainタイプまたは十分な座標がある場合はそのまま返す
+    if subtype == "main" or len(coords) > 10:
+        return coords
+
+    # subタイプ: 参照先の路線を取得
+    start_ref = subline.get("start", {})
+    end_ref = subline.get("end", {})
+    ref_railway = start_ref.get("railway") or end_ref.get("railway")
+
+    if not ref_railway or ref_railway not in all_railways_cache:
+        # 参照先が見つからない場合は元の座標を返す
+        return coords
+
+    # 参照先の座標を取得
+    ref_coords = all_railways_cache[ref_railway]
+
+    if len(coords) < 2 or len(ref_coords) < 2:
+        return coords
+
+    # sublineの始点・終点に最も近い参照座標のインデックスを見つける
+    start_point = coords[0]
+    end_point = coords[-1]
+
+    def find_nearest_idx(point, coord_list):
+        min_dist = float('inf')
+        min_idx = 0
+        for i, c in enumerate(coord_list):
+            dist = (c[0] - point[0])**2 + (c[1] - point[1])**2
+            if dist < min_dist:
+                min_dist = dist
+                min_idx = i
+        return min_idx
+
+    start_idx = find_nearest_idx(start_point, ref_coords)
+    end_idx = find_nearest_idx(end_point, ref_coords)
+
+    # 範囲を切り出し
+    if start_idx <= end_idx:
+        return ref_coords[start_idx:end_idx + 1]
+    else:
+        # 逆方向の場合は反転
+        return list(reversed(ref_coords[end_idx:start_idx + 1]))
+
+
+def merge_sublines_v2(
+    sublines: List[Dict],
+    is_loop: bool = False,
+    all_railways_cache: Optional[Dict[str, List[List[float]]]] = None
+) -> List[List[float]]:
+    """
+    sublinesを正しい順序でマージし、連続した座標配列を返す。
+    type=subのsublineは参照先の路線の座標を使用する。
+
+    Args:
+        sublines: coordinates.jsonのsublines配列
+        is_loop: 環状路線かどうか
+        all_railways_cache: 全路線の座標キャッシュ（参照解決用）
+
+    Returns:
+        マージされた座標のリスト [[lon, lat], ...]
+    """
+    if not sublines:
+        return []
+
+    if all_railways_cache is None:
+        all_railways_cache = {}
+
+    def coord_key(coord):
+        """座標を丸めてハッシュ可能なキーに変換"""
+        return (round(coord[0], 8), round(coord[1], 8))
+
+    # 1. 各sublineの座標を解決（type=subなら参照先を使用）
+    start_coords: Dict[tuple, List[int]] = {}  # coord_key -> [subline_index, ...]
+    end_coords: Dict[tuple, List[int]] = {}    # coord_key -> [subline_index, ...]
+
+    valid_sublines: List[tuple] = []
+    for i, sub in enumerate(sublines):
+        # 参照解決: type=subなら参照先の座標を使用
+        coords = resolve_subline_coords(sub, all_railways_cache)
+        if len(coords) >= 2:
+            valid_sublines.append((i, coords))
+
+            start_key = coord_key(coords[0])
+            end_key = coord_key(coords[-1])
+
+            start_coords.setdefault(start_key, []).append(i)
+            end_coords.setdefault(end_key, []).append(i)
+
+    if not valid_sublines:
+        return []
+
+    # 2. 接続グラフを構築（終点→始点）
+    graph: Dict[int, List[int]] = {i: [] for i, _ in valid_sublines}
+    in_degree: Dict[int, int] = {i: 0 for i, _ in valid_sublines}
+
+    for i, coords in valid_sublines:
+        end_key = coord_key(coords[-1])
+        if end_key in start_coords:
+            for j in start_coords[end_key]:
+                if i != j:
+                    graph[i].append(j)
+                    in_degree[j] += 1
+
+    # 3. 開始点を決定
+    start_idx = None
+    if is_loop:
+        # 環状路線: 最初のsublineから開始
+        start_idx = valid_sublines[0][0]
+    else:
+        # 非環状路線: 入次数0のsublineから開始
+        for i, _ in valid_sublines:
+            if in_degree[i] == 0:
+                start_idx = i
+                break
+        if start_idx is None:
+            start_idx = valid_sublines[0][0]
+
+    # 4. DFSで順序を決定
+    ordered_indices: List[int] = []
+    visited: set = set()
+
+    def dfs(idx: int):
+        if idx in visited:
+            return
+        visited.add(idx)
+        ordered_indices.append(idx)
+        for next_idx in graph[idx]:
+            if next_idx not in visited:
+                dfs(next_idx)
+
+    dfs(start_idx)
+
+    # 未訪問のsublineも追加（孤立したセグメント対応）
+    for i, _ in valid_sublines:
+        if i not in visited:
+            dfs(i)
+
+    # 5. 座標をマージ（重複除去）
+    merged_coords: List[List[float]] = []
+    idx_to_coords = {i: coords for i, coords in valid_sublines}
+
+    for i, idx in enumerate(ordered_indices):
+        coords = idx_to_coords.get(idx, [])
+        if not coords:
+            continue
+
+        if i == 0:
+            merged_coords.extend(coords)
+        else:
+            # 重複座標の除去
+            if merged_coords and coord_key(coords[0]) == coord_key(merged_coords[-1]):
+                merged_coords.extend(coords[1:])
+            else:
+                merged_coords.extend(coords)
+
+    return merged_coords
+
+
+def merge_sublines_fallback(sublines: List[Dict]) -> List[List[float]]:
+    """
+    フォールバック: 距離ベースの貪欲アルゴリズムでsublineを接続する。
+    グラフベースのマージが失敗した場合に使用。
+
+    Args:
+        sublines: coordinates.jsonのsublines配列
+
+    Returns:
+        マージされた座標のリスト [[lon, lat], ...]
+    """
+    if not sublines:
+        return []
+
+    def coord_key(coord):
+        return (round(coord[0], 8), round(coord[1], 8))
+
+    def dist_sq(c1, c2):
+        return (c1[0] - c2[0]) ** 2 + (c1[1] - c2[1]) ** 2
+
+    valid = [(i, sub.get("coords", [])) for i, sub in enumerate(sublines) if sub.get("coords")]
+    if not valid:
+        return []
+
+    used = [False] * len(valid)
+    result: List[List[float]] = []
+
+    # 最初のsublineから開始
+    used[0] = True
+    coords = valid[0][1]
+    result.extend(coords)
+    current_end = coords[-1]
+
+    for _ in range(len(valid) - 1):
+        best_idx = -1
+        best_dist = float('inf')
+        best_reversed = False
+
+        for i, (_, coords) in enumerate(valid):
+            if used[i] or not coords:
+                continue
+
+            d_start = dist_sq(coords[0], current_end)
+            if d_start < best_dist:
+                best_dist = d_start
+                best_idx = i
+                best_reversed = False
+
+            d_end = dist_sq(coords[-1], current_end)
+            if d_end < best_dist:
+                best_dist = d_end
+                best_idx = i
+                best_reversed = True
+
+        if best_idx < 0:
+            break
+
+        used[best_idx] = True
+        coords = valid[best_idx][1]
+        if best_reversed:
+            coords = list(reversed(coords))
+
+        if result and coord_key(coords[0]) == coord_key(result[-1]):
+            result.extend(coords[1:])
+        else:
+            result.extend(coords)
+
+        current_end = result[-1]
+
+    return result
+
+
+# ============================================================
+# API エンドポイント: 線路形状
+# ============================================================
 
 @app.get("/api/shapes")
 async def get_shapes(
@@ -298,32 +611,22 @@ async def get_shapes(
         logger.info(f"Did you mean one of these? {candidates}")
         raise HTTPException(status_code=404, detail=f"Shape not found in coordinates: {lineId} -> {target_id}")
 
-    # 3. 座標結合処理 (ここが失敗している可能性あり)
-    merged_coords: List[List[float]] = []
-    previous_end: Optional[List[float]] = None
+    # 3. 座標結合処理 (MS12: グラフベースのマージに改善 + 参照解決)
     sublines = entry.get("sublines", [])
-    
-    logger.info(f"Found entry for {target_id}, has {len(sublines)} sublines")
+    is_loop = entry.get("loop", False)
 
-    for i, sub in enumerate(sublines):
-        coords = sub.get("coords") or []
-        if not coords:
-            logger.warning(f"Subline {i} has no coords")
-            continue
+    logger.info(f"Found entry for {target_id}, has {len(sublines)} sublines, loop={is_loop}")
 
-        if previous_end is not None:
-            first = coords[0]
-            last = coords[-1]
+    # 参照解決用のキャッシュを構築（全路線の座標）
+    all_railways_cache = build_all_railways_cache(data_cache.coordinates)
 
-            # 単純な距離計算で反転判定
-            dist_to_first = (first[0] - previous_end[0]) ** 2 + (first[1] - previous_end[1]) ** 2
-            dist_to_last = (last[0] - previous_end[0]) ** 2 + (last[1] - previous_end[1]) ** 2
+    # グラフベースのマージを試行（参照解決を含む）
+    merged_coords = merge_sublines_v2(sublines, is_loop=is_loop, all_railways_cache=all_railways_cache)
 
-            if dist_to_last < dist_to_first:
-                coords = list(reversed(coords))
-
-        merged_coords.extend(coords)
-        previous_end = coords[-1]
+    # フォールバック: グラフベースが失敗した場合
+    if not merged_coords:
+        logger.warning(f"Graph-based merge failed for {target_id}, trying fallback")
+        merged_coords = merge_sublines_fallback(sublines)
 
     if not merged_coords:
         logger.error(f"Merged coords empty for {target_id}")
@@ -820,10 +1123,13 @@ async def get_train_positions_v4(line_id: str):
     # 1. 路線設定のロード
     line_config = get_line_config(line_id)
     if not line_config:
+        # 利用可能な路線一覧を取得
+        from config import SUPPORTED_LINES
+        available = ", ".join(sorted(SUPPORTED_LINES.keys())[:10]) + "..."
         raise HTTPException(
             status_code=404,
             detail=f"Line '{line_id}' is not supported. "
-                   f"Available lines: yamanote, chuo_rapid, keihin_tohoku, sobu_local"
+                   f"Available lines: {available} (51 lines total)"
         )
     
     api_key = os.getenv("ODPT_API_KEY", "").strip()
@@ -867,19 +1173,29 @@ async def get_train_positions_v4(line_id: str):
         # 4. レスポンス構築
         positions = []
         now_ts = None
-        
+
+        # デバッグ: direction 分布の統計
+        direction_stats = {}
+        status_stats = {}
+
         for r in results:
+            # 統計収集（invalidも含む）
+            d = r.direction or "None"
+            direction_stats[d] = direction_stats.get(d, 0) + 1
+            status_stats[r.status] = status_stats.get(r.status, 0) + 1
+
             if r.status == "invalid":
                 continue
-            
+
             # MS5: 座標計算（線路形状追従）
             coord = calculate_coordinates(r, data_cache, line_config.mt3d_id)
             lat = coord[0] if coord else None
             lon = coord[1] if coord else None
-            
+            bearing = coord[2] if coord and len(coord) > 2 else 0.0
+
             if now_ts is None:
                 now_ts = r.now_ts
-            
+
             positions.append({
                 "trip_id": r.trip_id,
                 "train_number": r.train_number,
@@ -891,6 +1207,7 @@ async def get_train_positions_v4(line_id: str):
                 "location": {
                     "latitude": round(lat, 6) if lat is not None else None,
                     "longitude": round(lon, 6) if lon is not None else None,
+                    "bearing": round(bearing, 2) if bearing is not None else 0.0,
                 },
                 
                 "segment": {
@@ -922,6 +1239,12 @@ async def get_train_positions_v4(line_id: str):
             "timestamp": now_ts or int(datetime.now(JST).timestamp()),
             "total_trains": len(positions),
             "positions": positions,
+            # デバッグ情報
+            "debug": {
+                "direction_stats": direction_stats,
+                "status_stats": status_stats,
+                "schedules_count": len(schedules),
+            },
         }
     
     except Exception as e:
@@ -936,3 +1259,283 @@ async def get_train_positions_v4(line_id: str):
             "total_trains": 0,
             "positions": [],
         }
+
+
+# ============================================================================
+# Route Search API (OTP + Train Position Integration)
+# ============================================================================
+
+def _identify_line_from_route_id(route_gtfs_id: str) -> Optional[str]:
+    """
+    OTPの route.gtfsId から路線IDを特定する。
+
+    Args:
+        route_gtfs_id: OTPの route.gtfsId (例: "1:11" または "1:JR-East.Yamanote")
+
+    Returns:
+        路線ID (例: "yamanote") または None
+    """
+    # "FeedId:RouteId" 形式から RouteId を抽出
+    if ":" in route_gtfs_id:
+        route_id = route_gtfs_id.split(":", 1)[1]
+    else:
+        route_id = route_gtfs_id
+
+    # 既知の路線IDとのマッピング
+    # OTPのGTFSデータでは数字IDが使われる場合がある
+    route_to_line = {
+        # 数字ID形式 (JR東日本GTFSデータ)
+        "10": "yamanote",           # 山手線
+        "11": "chuo_rapid",         # 中央線快速
+        "12": "sobu_local",         # 中央・総武緩行線
+        "22": "keihin_tohoku",      # 京浜東北・根岸線
+        # フルID形式 (バックアップ)
+        "JR-East.Yamanote": "yamanote",
+        "JR-East.ChuoRapid": "chuo_rapid",
+        "JR-East.KeihinTohokuNegishi": "keihin_tohoku",
+        "JR-East.ChuoSobuLocal": "sobu_local",
+    }
+
+    return route_to_line.get(route_id)
+
+
+def _extract_trip_id_suffix(trip_gtfs_id: str) -> str:
+    """
+    OTPの trip.gtfsId から trip_id サフィックスを抽出する。
+
+    Args:
+        trip_gtfs_id: OTPの trip.gtfsId (例: "1:4201301G")
+
+    Returns:
+        trip_id (例: "4201301G")
+    """
+    if ":" in trip_gtfs_id:
+        return trip_gtfs_id.split(":", 1)[1]
+    return trip_gtfs_id
+
+
+async def _get_train_positions_for_lines(
+    line_ids: List[str],
+    client: httpx.AsyncClient,
+    api_key: str
+) -> Dict[str, Dict]:
+    """
+    指定された路線の全列車位置を取得し、trip_idでアクセス可能な辞書を返す。
+
+    Returns:
+        { "trip_id_suffix": position_dict, ... }
+    """
+    from gtfs_rt_tripupdate import fetch_trip_updates
+    from train_position_v4 import compute_all_progress, calculate_coordinates
+
+    all_positions: Dict[str, Dict] = {}
+
+    for line_id in set(line_ids):  # 重複を除去
+        line_config = get_line_config(line_id)
+        if not line_config:
+            continue
+
+        try:
+            schedules = await fetch_trip_updates(
+                client,
+                api_key,
+                data_cache,
+                target_route_id=line_config.gtfs_route_id,
+                mt3d_prefix=line_config.mt3d_id
+            )
+
+            if not schedules:
+                continue
+
+            results = compute_all_progress(schedules, data_cache=data_cache)
+
+            for r in results:
+                if r.status == "invalid":
+                    continue
+
+                coord = calculate_coordinates(r, data_cache, line_config.mt3d_id)
+                lat = coord[0] if coord else None
+                lon = coord[1] if coord else None
+
+                all_positions[r.trip_id] = {
+                    "status": r.status,
+                    "latitude": round(lat, 6) if lat is not None else None,
+                    "longitude": round(lon, 6) if lon is not None else None,
+                    "delay": r.delay,
+                    "progress": round(r.progress, 4) if r.progress is not None else None,
+                    "segment": {
+                        "prev_station_id": r.prev_station_id,
+                        "next_station_id": r.next_station_id,
+                    }
+                }
+        except Exception as e:
+            logger.error(f"Failed to get positions for {line_id}: {e}")
+            continue
+
+    return all_positions
+
+
+@app.get("/api/route/search")
+async def route_search(
+    # 座標指定（駅名指定と排他）
+    from_lat: Optional[float] = Query(None, description="出発地の緯度"),
+    from_lon: Optional[float] = Query(None, description="出発地の経度"),
+    to_lat: Optional[float] = Query(None, description="目的地の緯度"),
+    to_lon: Optional[float] = Query(None, description="目的地の経度"),
+    # 駅名指定（座標指定と排他）
+    from_station: Optional[str] = Query(None, description="出発駅名（日本語または英語）"),
+    to_station: Optional[str] = Query(None, description="到着駅名（日本語または英語）"),
+    # 共通パラメータ
+    date: str = Query(..., description="日付 (YYYY-MM-DD)", regex=r"^\d{4}-\d{2}-\d{2}$"),
+    time: str = Query(..., description="時刻 (HH:MM)", regex=r"^\d{2}:\d{2}$"),
+    arrive_by: bool = Query(False, description="True: 到着時刻指定, False: 出発時刻指定"),
+):
+    """
+    乗換案内検索 + 使用電車の現在位置
+
+    座標または駅名で経路検索を行い、各電車区間について現在位置を付加して返す。
+
+    - 座標指定: from_lat, from_lon, to_lat, to_lon を使用
+    - 駅名指定: from_station, to_station を使用
+    """
+    if otp_search_route is None:
+        raise HTTPException(status_code=500, detail="OTP client not available")
+
+    # 駅名から座標を解決
+    resolved_from_station = None
+    resolved_to_station = None
+
+    if from_station:
+        coord = data_cache.get_station_coord_by_name(from_station)
+        if coord is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"出発駅 '{from_station}' が見つかりません"
+            )
+        from_lat, from_lon = coord
+        resolved_from_station = from_station
+
+    if to_station:
+        coord = data_cache.get_station_coord_by_name(to_station)
+        if coord is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"到着駅 '{to_station}' が見つかりません"
+            )
+        to_lat, to_lon = coord
+        resolved_to_station = to_station
+
+    # 座標のバリデーション
+    if from_lat is None or from_lon is None:
+        raise HTTPException(
+            status_code=400,
+            detail="出発地が指定されていません。from_lat/from_lon または from_station を指定してください"
+        )
+    if to_lat is None or to_lon is None:
+        raise HTTPException(
+            status_code=400,
+            detail="目的地が指定されていません。to_lat/to_lon または to_station を指定してください"
+        )
+
+    api_key = os.getenv("ODPT_API_KEY", "").strip()
+
+    try:
+        client = app.state.http_client
+
+        # 1. OTP で経路検索
+        otp_response = await otp_search_route(
+            client,
+            from_lat, from_lon,
+            to_lat, to_lon,
+            date, time,
+            arrive_by
+        )
+
+        if "errors" in otp_response:
+            return {
+                "status": "error",
+                "error": otp_response["errors"],
+                "query": {
+                    "from": {"lat": from_lat, "lon": from_lon},
+                    "to": {"lat": to_lat, "lon": to_lon},
+                    "date": date,
+                    "time": time,
+                    "arrive_by": arrive_by
+                },
+                "itineraries": []
+            }
+
+        # 2. OTP レスポンスをパース
+        itineraries = parse_otp_response(otp_response)
+
+        if not itineraries:
+            return {
+                "status": "no_routes",
+                "query": {
+                    "from": {"lat": from_lat, "lon": from_lon},
+                    "to": {"lat": to_lat, "lon": to_lon},
+                    "date": date,
+                    "time": time,
+                    "arrive_by": arrive_by
+                },
+                "itineraries": []
+            }
+
+        # 3. 使用される路線を特定
+        transit_modes = {"RAIL", "BUS", "SUBWAY", "TRAM", "FERRY", "CABLE_CAR", "GONDOLA", "FUNICULAR", "TRANSIT"}
+        line_ids_needed = set()
+        for itin in itineraries:
+            for leg in itin.get("legs", []):
+                if leg.get("mode") in transit_modes:
+                    route_info = leg.get("route", {})
+                    if route_info:
+                        route_gtfs_id = route_info.get("gtfs_id", "")
+                        line_id = _identify_line_from_route_id(route_gtfs_id)
+                        if line_id:
+                            line_ids_needed.add(line_id)
+
+        # 4. 必要な路線の列車位置を取得
+        train_positions = {}
+        if api_key and line_ids_needed:
+            train_positions = await _get_train_positions_for_lines(
+                list(line_ids_needed),
+                client,
+                api_key
+            )
+
+        # 5. 各 leg に現在位置情報を付加
+        for itin in itineraries:
+            for leg in itin.get("legs", []):
+                if leg.get("mode") in transit_modes:
+                    trip_gtfs_id = leg.get("trip_id", "")
+                    trip_id_suffix = _extract_trip_id_suffix(trip_gtfs_id)
+
+                    position = train_positions.get(trip_id_suffix)
+                    if position:
+                        leg["current_position"] = position
+                    else:
+                        leg["current_position"] = None
+
+        # クエリ情報を構築
+        query_info = {
+            "from": {"lat": from_lat, "lon": from_lon},
+            "to": {"lat": to_lat, "lon": to_lon},
+            "date": date,
+            "time": time,
+            "arrive_by": arrive_by
+        }
+        # 駅名で検索した場合は駅名も含める
+        if resolved_from_station:
+            query_info["from"]["station"] = resolved_from_station
+        if resolved_to_station:
+            query_info["to"]["station"] = resolved_to_station
+
+        return {
+            "status": "success",
+            "query": query_info,
+            "itineraries": itineraries
+        }
+
+    except Exception as e:
+        logger.error(f"Route search error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

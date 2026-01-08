@@ -20,7 +20,7 @@ from constants import (
     YAMANOTE_ROUTE_ID,  # デフォルト値用に維持
     HTTP_TIMEOUT,
 )
-from gtfs_rt_vehicle import is_yamanote, get_direction, get_train_number
+from gtfs_rt_vehicle import is_yamanote, get_direction, get_train_number, identify_routes_by_trip_id
 from train_state import determine_service_type
 
 if TYPE_CHECKING:
@@ -136,9 +136,8 @@ async def fetch_trip_updates(
         
         # route_id が空の場合は trip_id から路線を推定
         if not is_target_train:
-            from gtfs_rt_vehicle import identify_route_by_trip_id
-            inferred_route = identify_route_by_trip_id(trip_id)
-            if inferred_route and inferred_route == target_route_id:
+            possible_routes = identify_routes_by_trip_id(trip_id)
+            if target_route_id in possible_routes:
                 is_target_train = True
         
         if not is_target_train:
@@ -153,18 +152,26 @@ async def fetch_trip_updates(
         # 6. 列車情報の抽出
         train_number = get_train_number(trip_id)
         start_date = trip.start_date if trip.start_date else None
-        
-        # 7. 静的データ紐付けと direction 決定
-        static_train = data_cache.get_static_train(train_number, current_service_type)
-        
+
+        # 7. direction を先に推定（route_id を渡して路線固有の方向名を取得）
+        direction = get_direction(trip_id, target_route_id)
+
+        # 8. 静的データ紐付け（direction を含めて検索）
+        static_train = data_cache.get_static_train(train_number, current_service_type, direction)
+
+        # static_train が見つかれば、その direction を使用（より正確）
         if static_train:
             direction = static_train.direction
-        else:
-            # フォールバック: trip_id から推定
-            direction = get_direction(trip_id)
+
+        # デバッグ: 最初の数件の trip_id と direction をログ出力
+        if len(results) < 5:
+            logger.info(
+                f"[DIRECTION-DEBUG] trip_id={trip_id}, train_number={train_number}, "
+                f"direction={direction}, static_train={'found' if static_train else 'none'}"
+            )
         
-        # 8. stop_sequence -> station_id マップを取得
-        seq_to_station = data_cache.get_seq_to_station_map(train_number, current_service_type)
+        # 9. stop_sequence -> station_id マップを取得（direction を含めて検索）
+        seq_to_station = data_cache.get_seq_to_station_map(train_number, current_service_type, direction)
         
         # 9. stop_time_update の展開
         schedules_by_seq: Dict[int, RealtimeStationSchedule] = {}
@@ -212,7 +219,19 @@ async def fetch_trip_updates(
                     stations_list = railway.get("stations", [])
                     # stop_sequence は 1-based と仮定
                     if 1 <= stop_seq <= len(stations_list):
-                        station_id = stations_list[stop_seq - 1]
+                        # MS12: 方向に応じてインデックスを決定
+                        # ascending = Outbound (下り) → 順方向インデックス
+                        # descending = Inbound (上り) → 逆方向インデックス
+                        descending_direction = railway.get("descending", "Inbound")
+                        if direction == descending_direction:
+                            # Inbound: 逆順インデックス (stop_seq 1 → 最後の駅)
+                            idx = len(stations_list) - stop_seq
+                            station_id = stations_list[idx]
+                            if len(results) < 3 and stop_seq <= 3:
+                                logger.info(f"[MS12] Inbound seq {stop_seq} -> idx {idx} -> {station_id}")
+                        else:
+                            # Outbound: 順方向インデックス (stop_seq 1 → 最初の駅)
+                            station_id = stations_list[stop_seq - 1]
                         resolved = True
             
             # 到着・発車時刻の抽出

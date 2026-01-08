@@ -177,7 +177,14 @@ function AdminPanel() {
                   <select
                     className="control-input"
                     value={station.rank}
-                    onChange={(e) => updateStation(station.id, { rank: e.target.value })}
+                    onChange={(e) => {
+                      const newRank = e.target.value;
+                      const presets = { S: "50", A: "35", B: "20" };
+                      updateStation(station.id, {
+                        rank: newRank,
+                        dwell_time: presets[newRank] || "20",
+                      });
+                    }}
                   >
                     {RANK_OPTIONS.map((rank) => (
                       <option key={rank} value={rank}>

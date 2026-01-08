@@ -475,13 +475,31 @@ def _get_station_coord_v4(station_id, cache) -> Optional[tuple[float, float]]:
         return (coord[0], coord[1])
     return None
 
+def calculate_bearing(lat1, lon1, lat2, lon2):
+    """
+    2点間の方位角（北=0度, 時計回り）を計算する。
+    """
+    import math
+    
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dlambda = math.radians(lon2 - lon1)
+    
+    y = math.sin(dlambda) * math.cos(phi2)
+    x = math.cos(phi1) * math.sin(phi2) - \
+        math.sin(phi1) * math.cos(phi2) * math.cos(dlambda)
+    
+    theta = math.atan2(y, x)
+    bearing = (math.degrees(theta) + 360) % 360
+    return bearing
+
+
 def calculate_coordinates(
     progress_data: SegmentProgress,
     cache: "DataCache",
     line_id: str,
-) -> tuple[float, float] | None:
+) -> tuple[float, float, float] | None:
     """
-    MS3: SegmentProgress から座標を計算する（線路形状スナップ）。
+    MS3: SegmentProgress から座標を計算する（線路形状追従）。
     
     Args:
         progress_data: SegmentProgress（MS2の出力）
@@ -489,7 +507,8 @@ def calculate_coordinates(
         line_id: 路線ID (例: "JR-East.ChuoRapid")
         
     Returns:
-        (latitude, longitude) のタプル。計算不能なら None。
+        (latitude, longitude, bearing) のタプル。計算不能なら None。
+        bearing は北を0度とする時計回りの角度(0-360)。
     """
     
     status = progress_data.status
@@ -501,7 +520,9 @@ def calculate_coordinates(
             coord = _get_station_coord_v4(station_id, cache)
             if coord:
                 lon, lat = coord
-                return (lat, lon)
+                # 停車中は方向不定だが、描画の都合上 0 または前回の値を維持したい
+                # ここでは暫定 0
+                return (lat, lon, 0.0)
         return None
     
     # 2) running: 線路スナップ
@@ -522,7 +543,8 @@ def calculate_coordinates(
                 lon2, lat2 = c2
                 lat = lat1 + (lat2 - lat1) * progress
                 lon = lon1 + (lon2 - lon1) * progress
-                return (lat, lon)
+                bearing = calculate_bearing(lat1, lon1, lat2, lon2)
+                return (lat, lon, bearing)
             return None
 
         try:
@@ -560,7 +582,7 @@ def calculate_coordinates(
 
             if min_d_prev > 500 or min_d_next > 500:
                 # 駅が線路から遠すぎる
-                logger.debug(f"Stations too far from rail ({line_id}): {min_d_prev:.1f}m, {min_d_next:.1f}m")
+                # logger.debug(f"Stations too far from rail ({line_id}): {min_d_prev:.1f}m, {min_d_next:.1f}m")
                 return linear_fallback()
 
             if idx_prev == idx_next:
@@ -595,25 +617,41 @@ def calculate_coordinates(
                     break
             
             # 区間内補間
-            d_start = dists[found_idx]
+            # d_start = dists[found_idx] # unused
             d_end = dists[found_idx+1]
-            seg_len = d_end - d_start
+            seg_len = d_end - dists[found_idx]
+            
+            # p_start, p_end for bearing calculation
+            p_start = path[found_idx] # (lon, lat)
+            p_end = path[found_idx+1] # (lon, lat)
             
             if seg_len <= 0:
-                res_lon, res_lat = path[found_idx]
-                return (res_lat, res_lon)
+                # 区間長0なら始点座標
+                bearing = calculate_bearing(p_start[1], p_start[0], p_end[1], p_end[0]) if len(path) > 1 else 0
+                return (p_start[1], p_start[0], bearing)
 
-            ratio = (target_dist - d_start) / seg_len
-            p_start = path[found_idx]
-            p_end = path[found_idx+1]
+            ratio = (target_dist - dists[found_idx]) / seg_len
             
             res_lon = p_start[0] + (p_end[0] - p_start[0]) * ratio
             res_lat = p_start[1] + (p_end[1] - p_start[1]) * ratio
             
-            return (res_lat, res_lon)
+            # 方位角の計算
+            bearing = calculate_bearing(p_start[1], p_start[0], p_end[1], p_end[0])
+            
+            return (res_lat, res_lon, bearing)
 
         except Exception as e:
             logger.debug(f"Snap failed for {line_id}, fallback: {e}")
             return linear_fallback()
+
+    # 3) unknown: 始発駅または終着駅の座標を返す（フォールバック）
+    if status == "unknown":
+        # 最初に prev_station_id、なければ next_station_id を使用
+        station_id = progress_data.prev_station_id or progress_data.next_station_id
+        if station_id:
+            coord = _get_station_coord_v4(station_id, cache)
+            if coord:
+                lon, lat = coord
+                return (lat, lon)
 
     return None
